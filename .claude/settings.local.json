@@ -28,7 +28,8 @@
       "Bash(cargo:*)",
       "Bash(git add:*)",
       "Bash(open examples/nostr-client-full.html)",
-      "Bash(open examples/nostr-client-enhanced.html)"
+      "Bash(open examples/nostr-client-enhanced.html)",
+      "WebSearch"
     ],
     "deny": [],
     "ask": []

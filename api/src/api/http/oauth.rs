@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response, Html},
     Form, Json,
 };
+use base64::Engine;
 use chrono::{Duration, Utc};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,8 @@ pub struct AuthorizeRequest {
     pub client_id: String,
     pub redirect_uri: String,
     pub scope: Option<String>,
+    pub code_challenge: Option<String>,
+    pub code_challenge_method: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -24,6 +27,8 @@ pub struct ApproveRequest {
     pub redirect_uri: String,
     pub scope: String,
     pub approved: bool,
+    pub code_challenge: Option<String>,
+    pub code_challenge_method: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +36,7 @@ pub struct TokenRequest {
     pub code: String,
     pub client_id: String,
     pub redirect_uri: String,
+    pub code_verifier: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,6 +91,49 @@ impl From<sqlx::Error> for OAuthError {
     }
 }
 
+/// Validate PKCE code_verifier against stored code_challenge
+/// Implements RFC 7636 validation for both S256 and plain methods
+fn validate_pkce(
+    code_verifier: &str,
+    code_challenge: &str,
+    code_challenge_method: &str,
+) -> Result<(), OAuthError> {
+    match code_challenge_method {
+        "S256" => {
+            // Compute SHA256 hash of code_verifier
+            let hash = sha256::digest(code_verifier);
+
+            // Convert hex to bytes then base64url encode
+            let hash_bytes = hex::decode(&hash)
+                .map_err(|e| OAuthError::InvalidRequest(format!("Hash decode error: {}", e)))?;
+
+            // Base64 URL-safe encoding (no padding)
+            let computed_challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(&hash_bytes);
+
+            if computed_challenge != code_challenge {
+                tracing::warn!("PKCE validation failed: computed {} != stored {}",
+                    &computed_challenge[..16], &code_challenge[..16]);
+                return Err(OAuthError::InvalidRequest(
+                    "Invalid code_verifier: PKCE validation failed".to_string()
+                ));
+            }
+            Ok(())
+        }
+        "plain" => {
+            if code_verifier != code_challenge {
+                return Err(OAuthError::InvalidRequest(
+                    "Invalid code_verifier: plain PKCE validation failed".to_string()
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(OAuthError::InvalidRequest(
+            format!("Unsupported code_challenge_method: {}", code_challenge_method)
+        )),
+    }
+}
+
 /// GET /oauth/authorize
 /// Shows authorization approval page (or redirects to login if not authenticated)
 pub async fn authorize_get(
@@ -129,7 +178,7 @@ pub async fn authorize_post(
     let expires_at = Utc::now() + Duration::minutes(10);
 
     // Get or create application
-    let app_id: Option<i64> =
+    let app_id: Option<i32> =
         sqlx::query_scalar("SELECT id FROM oauth_applications WHERE tenant_id = $1 AND client_id = $2")
             .bind(tenant_id)
             .bind(&req.client_id)
@@ -155,10 +204,10 @@ pub async fn authorize_post(
         .await?
     };
 
-    // Store authorization code
+    // Store authorization code with PKCE support
     sqlx::query(
-        "INSERT INTO oauth_codes (tenant_id, code, user_public_key, application_id, redirect_uri, scope, expires_at, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        "INSERT INTO oauth_codes (tenant_id, code, user_public_key, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
     )
     .bind(tenant_id)
     .bind(&code)
@@ -166,6 +215,8 @@ pub async fn authorize_post(
     .bind(app_id)
     .bind(&req.redirect_uri)
     .bind(&req.scope)
+    .bind(&req.code_challenge)
+    .bind(&req.code_challenge_method)
     .bind(expires_at)
     .bind(Utc::now())
     .execute(&auth_state.state.db)
@@ -190,9 +241,10 @@ pub async fn token(
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
-    // Fetch and validate authorization code
-    let auth_code: Option<(String, i64, String, String)> = sqlx::query_as(
-        "SELECT user_public_key, application_id, redirect_uri, scope FROM oauth_codes
+    // Fetch and validate authorization code with PKCE fields
+    let auth_code: Option<(String, i32, String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT user_public_key, application_id, redirect_uri, scope, code_challenge, code_challenge_method
+         FROM oauth_codes
          WHERE tenant_id = $1 AND code = $2 AND expires_at > $3"
     )
     .bind(tenant_id)
@@ -201,7 +253,7 @@ pub async fn token(
     .fetch_optional(pool)
     .await?;
 
-    let (user_public_key, application_id, stored_redirect_uri, _scope) =
+    let (user_public_key, application_id, stored_redirect_uri, _scope, code_challenge, code_challenge_method) =
         auth_code.ok_or(OAuthError::Unauthorized)?;
 
     // Validate redirect_uri matches
@@ -209,6 +261,18 @@ pub async fn token(
         return Err(OAuthError::InvalidRequest(
             "redirect_uri mismatch".to_string(),
         ));
+    }
+
+    // PKCE validation (if code_challenge was provided during authorization)
+    if let Some(challenge) = code_challenge {
+        let method = code_challenge_method.as_deref().unwrap_or("plain");
+        let verifier = req.code_verifier.as_ref().ok_or_else(|| {
+            OAuthError::InvalidRequest("code_verifier required for PKCE flow".to_string())
+        })?;
+
+        validate_pkce(verifier, &challenge, method)?;
+
+        tracing::debug!("PKCE validation successful for code: {}", &req.code[..8]);
     }
 
     // Delete the authorization code (one-time use)
@@ -584,7 +648,7 @@ pub async fn connect_post(
     // Create or get application - use client pubkey as identifier
     let app_name = format!("nostr-login-{}", &form.client_pubkey[..12]);
 
-    let app_id: i64 = match sqlx::query_scalar::<_, i64>(
+    let app_id: i32 = match sqlx::query_scalar::<_, i32>(
         "SELECT id FROM oauth_applications WHERE tenant_id = ?1 AND client_id = ?2"
     )
     .bind(tenant_id)
