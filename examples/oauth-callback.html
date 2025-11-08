@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OAuth Callback</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        .message {
+            text-align: center;
+            font-size: 18px;
+        }
+        .success { color: #03dac6; }
+        .error { color: #cf6679; }
+    </style>
+</head>
+<body>
+    <div class="message" id="message">Processing OAuth callback...</div>
+
+    <script>
+        // OAuth Callback Handler
+        // This page receives the authorization code and sends it back to the opener
+
+        const params = new URLSearchParams(window.location.search);
+        const code = params.get('code');
+        const error = params.get('error');
+        const errorDescription = params.get('error_description');
+
+        const messageEl = document.getElementById('message');
+
+        if (window.opener) {
+            const message = {
+                type: 'oauth_callback',
+                ...(code && { code }),
+                ...(error && { error }),
+                ...(errorDescription && { error_description: errorDescription }),
+            };
+
+            // Send message to parent window with origin validation
+            try {
+                window.opener.postMessage(message, window.location.origin);
+
+                if (code) {
+                    messageEl.className = 'message success';
+                    messageEl.textContent = '✓ Authorization successful! Closing window...';
+                } else {
+                    messageEl.className = 'message error';
+                    messageEl.textContent = `✗ Authorization ${error || 'failed'}`;
+                }
+
+                // Auto-close popup after brief delay
+                setTimeout(() => {
+                    window.close();
+                }, 1000);
+            } catch (e) {
+                messageEl.className = 'message error';
+                messageEl.textContent = 'Failed to communicate with parent window';
+                console.error('postMessage failed:', e);
+            }
+        } else {
+            messageEl.className = 'message error';
+            messageEl.textContent = 'This page must be opened from the OAuth client';
+        }
+    </script>
+</body>
+</html>

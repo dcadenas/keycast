@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Keycast OAuth + PKCE Test (Popup Flow)</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #e0e0e0;
+        }
+        h1 { color: #bb86fc; }
+        .section {
+            background: #2a2a2a;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+        }
+        input, button {
+            padding: 12px;
+            margin: 8px 0;
+            border-radius: 6px;
+            border: 1px solid #4a4a4a;
+            background: #3a3a3a;
+            color: #e0e0e0;
+            font-size: 14px;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        button {
+            background: #bb86fc;
+            color: #000;
+            font-weight: 600;
+            cursor: pointer;
+            width: auto;
+            padding: 12px 24px;
+        }
+        button:hover { background: #cb96fc; }
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        .status {
+            margin-top: 15px;
+            padding: 15px;
+            border-radius: 6px;
+        }
+        .success { background: #1b5e20; border-left: 4px solid #03dac6; }
+        .error { background: #b71c1c; border-left: 4px solid #cf6679; }
+        .info { background: #1a237e; border-left: 4px solid #03a9f4; }
+        pre {
+            background: #1a1a1a;
+            padding: 12px;
+            border-radius: 4px;
+            overflow-x: auto;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔐 OAuth + PKCE Test (Popup Flow)</h1>
+    <p>Real OAuth 2.0 authorization code flow with PKCE security</p>
+
+    <div class="section">
+        <h2>Configuration</h2>
+        <label>API URL:</label>
+        <input type="text" id="apiUrl" value="http://localhost:3000">
+
+        <label>Client ID:</label>
+        <input type="text" id="clientId" value="test-webapp">
+
+        <label>Redirect URI:</label>
+        <input type="text" id="redirectUri" value="http://localhost:3000/examples/oauth-callback.html">
+    </div>
+
+    <div class="section">
+        <h2>OAuth Flow</h2>
+        <button onclick="connectWithKeycast()">Connect with Keycast</button>
+        <div id="status"></div>
+    </div>
+
+    <div class="section" id="results" style="display: none;">
+        <h2>✓ Bunker URL Received</h2>
+        <pre id="bunkerUrl"></pre>
+        <p style="color: #03dac6;">You can now use this bunker URL in any NIP-46 client!</p>
+    </div>
+
+    <script>
+        let pkceVerifier = null;
+        let pkceChallenge = null;
+
+        // PKCE Helpers
+        function base64URLEncode(buffer) {
+            return btoa(String.fromCharCode(...new Uint8Array(buffer)))
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_')
+                .replace(/=/g, '');
+        }
+
+        async function generatePKCE() {
+            const verifierBytes = new Uint8Array(32);
+            crypto.getRandomValues(verifierBytes);
+            const verifier = base64URLEncode(verifierBytes);
+
+            const encoder = new TextEncoder();
+            const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(verifier));
+            const challenge = base64URLEncode(hashBuffer);
+
+            return { verifier, challenge };
+        }
+
+        function showStatus(message, type = 'info') {
+            const el = document.getElementById('status');
+            el.innerHTML = `<div class="status ${type}">${message}</div>`;
+        }
+
+        // OAuth Popup Flow
+        async function connectWithKeycast() {
+            const apiUrl = document.getElementById('apiUrl').value;
+            const clientId = document.getElementById('clientId').value;
+            const redirectUri = document.getElementById('redirectUri').value;
+
+            showStatus('Generating PKCE challenge...', 'info');
+
+            // Generate PKCE
+            const pkce = await generatePKCE();
+            pkceVerifier = pkce.verifier;
+            pkceChallenge = pkce.challenge;
+
+            // Store verifier for callback
+            sessionStorage.setItem('pkce_verifier', pkceVerifier);
+
+            showStatus(`PKCE Generated<br><small>Challenge: ${pkceChallenge.substring(0, 40)}...</small>`, 'info');
+
+            // Build authorization URL
+            const authUrl = new URL(`${apiUrl}/api/oauth/authorize`);
+            authUrl.searchParams.set('client_id', clientId);
+            authUrl.searchParams.set('redirect_uri', redirectUri);
+            authUrl.searchParams.set('scope', 'sign_event encrypt decrypt');
+            authUrl.searchParams.set('code_challenge', pkceChallenge);
+            authUrl.searchParams.set('code_challenge_method', 'S256');
+
+            // Open popup
+            const width = 500, height = 700;
+            const left = window.screenX + (window.outerWidth - width) / 2;
+            const top = window.screenY + (window.outerHeight - height) / 2;
+
+            const popup = window.open(
+                authUrl.toString(),
+                'keycast-oauth',
+                `width=${width},height=${height},left=${left},top=${top}`
+            );
+
+            if (!popup) {
+                showStatus('✗ Popup blocked! Please allow popups for this site.', 'error');
+                return;
+            }
+
+            showStatus('✓ Popup opened. Login and approve in the popup window...', 'success');
+        }
+
+        // Listen for callback from popup
+        window.addEventListener('message', async (event) => {
+            // Validate origin
+            if (event.origin !== window.location.origin) {
+                console.warn('Rejected message from', event.origin);
+                return;
+            }
+
+            if (event.data.type !== 'oauth_callback') return;
+
+            // Handle error
+            if (event.data.error) {
+                showStatus(`✗ Authorization failed: ${event.data.error}`, 'error');
+                return;
+            }
+
+            // Handle success - exchange code
+            if (event.data.code) {
+                const code = event.data.code;
+                showStatus(`✓ Code received: ${code.substring(0, 12)}...<br>Exchanging for bunker URL...`, 'info');
+
+                await exchangeCode(code);
+            }
+        });
+
+        async function exchangeCode(code) {
+            const apiUrl = document.getElementById('apiUrl').value;
+            const clientId = document.getElementById('clientId').value;
+            const redirectUri = document.getElementById('redirectUri').value;
+
+            // Get PKCE verifier from sessionStorage
+            const verifier = sessionStorage.getItem('pkce_verifier');
+            if (!verifier) {
+                showStatus('✗ PKCE verifier not found. Please restart OAuth flow.', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${apiUrl}/api/oauth/token`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        code,
+                        client_id: clientId,
+                        redirect_uri: redirectUri,
+                        code_verifier: verifier
+                    })
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.bunker_url) {
+                    showStatus('✓ Token exchange successful!', 'success');
+                    document.getElementById('results').style.display = 'block';
+                    document.getElementById('bunkerUrl').textContent = data.bunker_url;
+
+                    // Clean up
+                    sessionStorage.removeItem('pkce_verifier');
+                } else {
+                    showStatus(`✗ Token exchange failed: ${data.error || 'Unknown error'}`, 'error');
+                }
+            } catch (error) {
+                showStatus(`✗ Error: ${error.message}`, 'error');
+            }
+        }
+    </script>
+</body>
+</html>
