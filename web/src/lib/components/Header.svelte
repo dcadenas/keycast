@@ -22,6 +22,7 @@ const activePage = $derived($page.url.pathname);
     <nav class="flex flex-row items-center justify-start gap-4">
         {#if user}
             <a class="nav-link {activePage === '/teams' ? 'active' : ''} bordered" href="/teams">Teams</a>
+            <a class="nav-link {activePage === '/settings/permissions' ? 'active' : ''} bordered" href="/settings/permissions">Sessions</a>
             <button
                 onclick={() => signout(ndk)}
                 ontouchend={() => signout(ndk)}

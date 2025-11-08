@@ -28,7 +28,11 @@ export class KeycastApi {
         console.log("Making request to:", url);
         const headers = { ...this.defaultHeaders, ...options.headers };
 
-        const response = await fetch(url, { ...options, headers });
+        const response = await fetch(url, {
+            ...options,
+            headers,
+            credentials: options.credentials || 'include'  // Include cookies by default
+        });
 
         if (!response.ok) {
             throw new Error(`HTTP ${response.status}: ${response.statusText}`);

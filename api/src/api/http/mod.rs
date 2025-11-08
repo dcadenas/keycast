@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod jwt_utils;
 pub mod oauth;
 pub mod routes;
 pub mod teams;

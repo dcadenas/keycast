@@ -45,6 +45,7 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
     // OAuth routes (no authentication required for initial authorize request)
     // Public CORS - third parties can use OAuth flow (they never see passwords)
     let oauth_routes = Router::new()
+        .route("/oauth/auth-status", get(oauth::auth_status))
         .route("/oauth/authorize", get(oauth::authorize_get))
         .route("/oauth/authorize", post(oauth::authorize_post))
         .route("/oauth/token", post(oauth::token))

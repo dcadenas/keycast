@@ -1,81 +1,89 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { browser } from '$app/environment';
+	import { getCurrentUser } from '$lib/current_user.svelte';
+	import { KeycastApi } from '$lib/keycast_api.svelte';
+	import ndk from '$lib/ndk.svelte';
+	import { NDKNip07Signer } from '@nostr-dev-kit/ndk';
+	import { toast } from 'svelte-hot-french-toast';
+	import type { BunkerSession } from '$lib/types';
 
-	interface PermissionDetail {
-		application_name: string;
-		application_id: number;
-		policy_name: string;
-		policy_id: number;
-		allowed_event_kinds: number[];
-		event_kind_names: string[];
-		created_at: string;
-		last_activity: string | null;
-		activity_count: number;
-		secret: string;
-	}
+	const api = new KeycastApi();
+	const currentUser = $derived(getCurrentUser());
+	const user = $derived(currentUser?.user);
 
-	let permissions: PermissionDetail[] = [];
-	let loading = true;
-	let error = '';
-	let showRevokeModal = false;
-	let selectedPermission: PermissionDetail | null = null;
+	let sessions = $state<BunkerSession[]>([]);
+	let isLoading = $state(true);
+	let error = $state('');
+	let showRevokeModal = $state(false);
+	let selectedSession = $state<BunkerSession | null>(null);
 
-	async function loadPermissions() {
+	async function loadSessions() {
 		try {
-			loading = true;
+			isLoading = true;
 			error = '';
 
-			// Get JWT token from localStorage
-			const token = localStorage.getItem('token');
-			if (!token) {
-				error = 'Not authenticated. Please log in.';
-				loading = false;
-				return;
-			}
+			let authHeaders: Record<string, string> = {};
 
-			const response = await fetch('/api/user/permissions', {
-				headers: {
-					'Authorization': `Bearer ${token}`
-				}
+			// If NIP-07 user, build NIP-98 auth event
+			if (user?.pubkey && ndk.signer) {
+				const authEvent = await api.buildUnsignedAuthEvent('/user/sessions', 'GET', user.pubkey);
+				await authEvent?.sign();
+				authHeaders.Authorization = `Nostr ${btoa(JSON.stringify(authEvent))}`;
+			}
+			// Otherwise backend will use HttpOnly cookie (sent automatically with credentials: 'include')
+
+			const response = await api.get<{ sessions: BunkerSession[] }>('/user/sessions', {
+				headers: authHeaders
 			});
 
-			if (!response.ok) {
-				throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+			sessions = response.sessions;
+		} catch (err: any) {
+			// Check if it's an auth error
+			if (err.message?.includes('401') || err.message?.includes('Unauthorized')) {
+				error = 'Not authenticated. Please sign in with email/password or NIP-07 browser extension.';
+			} else {
+				error = `Failed to load sessions: ${err}`;
 			}
-
-			const data = await response.json();
-			permissions = data.permissions;
-		} catch (err) {
-			error = `Failed to load permissions: ${err}`;
-			console.error('Load permissions error:', err);
+			console.error('Load sessions error:', err);
 		} finally {
-			loading = false;
+			isLoading = false;
 		}
 	}
 
-	async function revokePermission(secret: string) {
+	async function revokeSession(secret: string) {
 		try {
-			const token = localStorage.getItem('token');
-			const response = await fetch('/api/user/sessions/revoke', {
-				method: 'POST',
-				headers: {
-					'Authorization': `Bearer ${token}`,
-					'Content-Type': 'application/json'
-				},
-				body: JSON.stringify({ secret })
-			});
+			let authHeaders: Record<string, string> = {};
 
-			if (!response.ok) {
-				throw new Error('Failed to revoke permission');
+			// If NIP-07 user, build NIP-98 auth event
+			if (user?.pubkey && ndk.signer) {
+				const body = JSON.stringify({ secret });
+				const authEvent = await api.buildUnsignedAuthEvent(
+					'/user/sessions/revoke',
+					'POST',
+					user.pubkey,
+					body
+				);
+				await authEvent?.sign();
+				authHeaders.Authorization = `Nostr ${btoa(JSON.stringify(authEvent))}`;
 			}
+			// Otherwise backend will use HttpOnly cookie (sent automatically)
 
-			// Reload permissions after revoke
-			await loadPermissions();
+			await api.post(
+				'/user/sessions/revoke',
+				{ secret },
+				{
+					headers: authHeaders
+				}
+			);
+
+			toast.success('Session revoked successfully');
 			showRevokeModal = false;
-			selectedPermission = null;
+			selectedSession = null;
+
+			// Reload sessions
+			await loadSessions();
 		} catch (err) {
-			error = `Failed to revoke: ${err}`;
+			error = `Failed to revoke session: ${err}`;
+			toast.error('Failed to revoke session');
 		}
 	}
 
@@ -84,75 +92,54 @@
 		return date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
 	}
 
-	function getRiskBadgeColor(kinds: number[]): string {
-		// Check for high-risk kinds
-		if (kinds.includes(5)) return 'badge-critical'; // Deletion
-		if (kinds.includes(9734)) return 'badge-high'; // Zaps (money)
-		if (kinds.includes(23194) || kinds.includes(23195)) return 'badge-critical'; // Wallet
-		if (kinds.includes(4) || kinds.includes(44)) return 'badge-sensitive'; // DMs
-		return 'badge-safe';
-	}
-
-	function getRiskLabel(kinds: number[]): string {
-		if (kinds.includes(5)) return 'CRITICAL';
-		if (kinds.includes(9734)) return 'HIGH';
-		if (kinds.includes(23194) || kinds.includes(23195)) return 'CRITICAL';
-		if (kinds.includes(4) || kinds.includes(44)) return 'SENSITIVE';
-		return 'MODERATE';
-	}
-
-	onMount(() => {
-		if (browser) {
-			loadPermissions();
-		}
+	// Load sessions when component mounts or when auth changes
+	$effect(() => {
+		loadSessions();
 	});
 </script>
 
 <svelte:head>
-	<title>Permissions - Keycast</title>
+	<title>Connected Apps - Keycast</title>
 </svelte:head>
 
 <div class="permissions-page">
 	<div class="header">
-		<h1>🔐 App Permissions</h1>
-		<p class="subtitle">
-			Manage which apps can sign events on your behalf
-		</p>
+		<h1>Connected Apps</h1>
+		<p class="subtitle">Manage apps that can sign events on your behalf via NIP-46</p>
 	</div>
 
-	{#if loading}
+	{#if isLoading}
 		<div class="loading">
 			<div class="spinner"></div>
-			<p>Loading permissions...</p>
+			<p>Loading sessions...</p>
 		</div>
 	{:else if error}
 		<div class="error-box">
 			<h3>Error</h3>
 			<p>{error}</p>
-			<button on:click={loadPermissions}>Retry</button>
+			<button onclick={loadSessions}>Retry</button>
 		</div>
-	{:else if permissions.length === 0}
+	{:else if sessions.length === 0}
 		<div class="empty-state">
-			<h3>No Active Permissions</h3>
+			<h3>No Active Sessions</h3>
 			<p>You haven't authorized any apps yet.</p>
 		</div>
 	{:else}
 		<div class="permissions-list">
-			{#each permissions as perm}
+			{#each sessions as session}
 				<div class="permission-card">
 					<div class="card-header">
 						<div>
-							<h3>{perm.application_name}</h3>
-							<p class="policy-name">Policy: {perm.policy_name}</p>
+							<h3>{session.application_name}</h3>
+							{#if session.client_pubkey}
+								<p class="policy-name">Client: {session.client_pubkey.substring(0, 16)}...</p>
+							{/if}
 						</div>
 						<div class="card-actions">
-							<span class="risk-badge {getRiskBadgeColor(perm.allowed_event_kinds)}">
-								{getRiskLabel(perm.allowed_event_kinds)}
-							</span>
 							<button
 								class="btn-revoke"
-								on:click={() => {
-									selectedPermission = perm;
+								onclick={() => {
+									selectedSession = session;
 									showRevokeModal = true;
 								}}
 							>
@@ -162,29 +149,24 @@
 					</div>
 
 					<div class="card-body">
-						<div class="info-section">
-							<h4>Allowed Actions ({perm.event_kind_names.length})</h4>
-							<div class="event-kinds">
-								{#each perm.event_kind_names as name}
-									<span class="kind-badge">{name}</span>
-								{/each}
-							</div>
-						</div>
-
 						<div class="info-grid">
 							<div class="info-item">
 								<span class="label">Created:</span>
-								<span class="value">{formatDate(perm.created_at)}</span>
+								<span class="value">{formatDate(session.created_at)}</span>
 							</div>
 							<div class="info-item">
 								<span class="label">Last Activity:</span>
 								<span class="value">
-									{perm.last_activity ? formatDate(perm.last_activity) : 'Never'}
+									{session.last_activity ? formatDate(session.last_activity) : 'Never'}
 								</span>
 							</div>
 							<div class="info-item">
 								<span class="label">Total Signs:</span>
-								<span class="value">{perm.activity_count}</span>
+								<span class="value">{session.activity_count}</span>
+							</div>
+							<div class="info-item">
+								<span class="label">Bunker Pubkey:</span>
+								<span class="value mono">{session.bunker_pubkey.substring(0, 16)}...</span>
 							</div>
 						</div>
 					</div>
@@ -194,24 +176,20 @@
 	{/if}
 </div>
 
-{#if showRevokeModal && selectedPermission}
-	<div class="modal-overlay" on:click={() => showRevokeModal = false}>
-		<div class="modal" on:click|stopPropagation>
-			<h3>Revoke Permission?</h3>
+{#if showRevokeModal && selectedSession}
+	<div class="modal-overlay" onclick={() => (showRevokeModal = false)}>
+		<div class="modal" onclick={(e) => e.stopPropagation()}>
+			<h3>Revoke Session?</h3>
 			<p>
 				Are you sure you want to revoke access for
-				<strong>{selectedPermission.application_name}</strong>?
+				<strong>{selectedSession.application_name}</strong>?
 			</p>
-			<p class="warning">
-				This app will no longer be able to sign events on your behalf.
-			</p>
+			<p class="warning">This app will no longer be able to sign events on your behalf.</p>
 			<div class="modal-actions">
-				<button class="btn-cancel" on:click={() => showRevokeModal = false}>
-					Cancel
-				</button>
+				<button class="btn-cancel" onclick={() => (showRevokeModal = false)}> Cancel </button>
 				<button
 					class="btn-confirm-revoke"
-					on:click={() => revokePermission(selectedPermission!.secret)}
+					onclick={() => selectedSession && revokeSession(selectedSession.secret)}
 				>
 					Revoke Access
 				</button>
@@ -262,7 +240,9 @@
 	}
 
 	@keyframes spin {
-		to { transform: rotate(360deg); }
+		to {
+			transform: rotate(360deg);
+		}
 	}
 
 	.error-box {
@@ -338,41 +318,6 @@
 		align-items: center;
 	}
 
-	.risk-badge {
-		padding: 0.4rem 0.8rem;
-		border-radius: 4px;
-		font-size: 0.75rem;
-		font-weight: bold;
-		text-transform: uppercase;
-		letter-spacing: 0.5px;
-	}
-
-	.badge-safe {
-		background: #1b5e20;
-		color: #4caf50;
-	}
-
-	.badge-sensitive {
-		background: #e65100;
-		color: #ff9800;
-	}
-
-	.badge-high {
-		background: #b71c1c;
-		color: #f44336;
-	}
-
-	.badge-critical {
-		background: #880e4f;
-		color: #e91e63;
-		animation: pulse 2s ease-in-out infinite;
-	}
-
-	@keyframes pulse {
-		0%, 100% { opacity: 1; }
-		50% { opacity: 0.7; }
-	}
-
 	.btn-revoke {
 		padding: 0.5rem 1rem;
 		background: transparent;
@@ -391,32 +336,6 @@
 
 	.card-body {
 		padding: 1.5rem;
-	}
-
-	.info-section {
-		margin-bottom: 1.5rem;
-	}
-
-	.info-section h4 {
-		margin: 0 0 1rem 0;
-		color: #03dac6;
-		font-size: 1rem;
-	}
-
-	.event-kinds {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.5rem;
-	}
-
-	.kind-badge {
-		display: inline-block;
-		padding: 0.4rem 0.8rem;
-		background: #2a2a2a;
-		border: 1px solid #444;
-		border-radius: 6px;
-		font-size: 0.85rem;
-		color: #e0e0e0;
 	}
 
 	.info-grid {
@@ -441,6 +360,10 @@
 	.value {
 		font-size: 1rem;
 		color: #e0e0e0;
+	}
+
+	.mono {
+		font-family: monospace;
 	}
 
 	.modal-overlay {

@@ -3,7 +3,7 @@
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response, Html},
     Form, Json,
 };
@@ -134,15 +134,484 @@ fn validate_pkce(
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct AuthStatusResponse {
+    pub authenticated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<String>,
+}
+
+/// GET /oauth/auth-status
+/// Check if user has a valid session cookie
+pub async fn auth_status(
+    headers: HeaderMap,
+) -> Result<Json<AuthStatusResponse>, OAuthError> {
+    if let Some(user_pubkey) = super::jwt_utils::extract_user_from_jwt_cookie(&headers) {
+        Ok(Json(AuthStatusResponse {
+            authenticated: true,
+            pubkey: Some(user_pubkey),
+        }))
+    } else {
+        Ok(Json(AuthStatusResponse {
+            authenticated: false,
+            pubkey: None,
+        }))
+    }
+}
+
 /// GET /oauth/authorize
-/// Shows authorization approval page (or redirects to login if not authenticated)
+/// Shows login form if not authenticated, or auto-approves if already authorized, or shows approval page
 pub async fn authorize_get(
-    State(_auth_state): State<super::routes::AuthState>,
-    Query(_params): Query<AuthorizeRequest>,
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
+    Query(params): Query<AuthorizeRequest>,
 ) -> Result<Response, OAuthError> {
-    // TODO: Extract user from session/JWT
-    // For now, return OK to pass the test structure
-    Ok((StatusCode::OK, "Authorization page").into_response())
+    use axum::response::Html;
+
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+
+    // Check if user is authenticated via cookie
+    let user_pubkey = super::jwt_utils::extract_user_from_jwt_cookie(&headers);
+
+    // If authenticated, check if they've already authorized this app
+    if let Some(ref pubkey) = user_pubkey {
+        // Get application ID
+        let app_id: Option<i32> = sqlx::query_scalar(
+            "SELECT id FROM oauth_applications WHERE tenant_id = $1 AND client_id = $2"
+        )
+        .bind(tenant_id)
+        .bind(&params.client_id)
+        .fetch_optional(pool)
+        .await?;
+
+        tracing::info!("Auto-approve check: client_id={}, app_id={:?}, user_pubkey={}",
+            params.client_id, app_id, pubkey);
+
+        if let Some(app_id) = app_id {
+            // Check if user has already authorized this app
+            let existing_auth: Option<(i32,)> = sqlx::query_as(
+                "SELECT id FROM oauth_authorizations
+                 WHERE tenant_id = $1 AND user_public_key = $2 AND application_id = $3"
+            )
+            .bind(tenant_id)
+            .bind(pubkey)
+            .bind(app_id)
+            .fetch_optional(pool)
+            .await?;
+
+            tracing::info!("Existing authorization check: found={}", existing_auth.is_some());
+
+            if existing_auth.is_some() {
+                tracing::info!("Auto-approving: user has already authorized this app");
+                // Auto-approve: generate code and send directly to parent window
+                let code: String = rand::thread_rng()
+                    .sample_iter(&rand::distributions::Alphanumeric)
+                    .take(32)
+                    .map(char::from)
+                    .collect();
+
+                let expires_at = Utc::now() + Duration::minutes(10);
+
+                sqlx::query(
+                    "INSERT INTO oauth_codes (tenant_id, code, user_public_key, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+                )
+                .bind(tenant_id)
+                .bind(&code)
+                .bind(pubkey)
+                .bind(app_id)
+                .bind(&params.redirect_uri)
+                .bind(params.scope.as_deref().unwrap_or("sign_event"))
+                .bind(&params.code_challenge)
+                .bind(&params.code_challenge_method)
+                .bind(expires_at)
+                .bind(Utc::now())
+                .execute(pool)
+                .await?;
+
+                // Return inline HTML that sends code to parent and closes immediately (no flicker)
+                let auto_approve_html = format!(r#"
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body>
+<script>
+window.opener.postMessage({{ type: 'oauth_callback', code: '{}' }}, window.location.origin);
+window.close();
+</script>
+</body>
+</html>
+                "#, code);
+
+                return Ok(Html(auto_approve_html).into_response());
+            }
+        }
+    }
+
+    let html = if let Some(pubkey) = user_pubkey {
+        // User is authenticated - show approval screen
+        format!(r#"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Authorize {}</title>
+    <style>
+        body {{
+            font-family: -apple-system, sans-serif;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+        }}
+        .container {{
+            background: #2a2a2a;
+            padding: 40px;
+            border-radius: 12px;
+            max-width: 400px;
+            width: 100%;
+        }}
+        h1 {{ color: #bb86fc; margin-bottom: 10px; }}
+        .info {{ color: #888; font-size: 14px; margin-bottom: 20px; }}
+        .user-info {{ background: #1a1a1a; padding: 10px; border-radius: 4px; margin: 10px 0; font-size: 12px; word-break: break-all; }}
+        .scope {{ background: #1a1a1a; padding: 10px; border-radius: 4px; margin: 15px 0; }}
+        button {{
+            width: 100%;
+            padding: 14px;
+            margin: 8px 0;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+        }}
+        .approve {{ background: #03dac6; color: #000; }}
+        .approve:hover {{ background: #04e5d4; }}
+        .deny {{ background: #cf6679; color: #fff; }}
+        .deny:hover {{ background: #e07788; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Authorize Access</h1>
+        <p class="info"><strong>{}</strong> wants to access your Nostr account</p>
+
+        <div class="user-info">
+            <strong>Logged in as:</strong><br>
+            <small>{}</small>
+        </div>
+
+        <div class="scope">
+            <strong>Permissions requested:</strong><br>
+            <small>{}</small>
+        </div>
+
+        <button class="approve" onclick="approve()">✓ Approve</button>
+        <button class="deny" onclick="deny()">✗ Deny</button>
+    </div>
+
+    <script>
+        const clientId = '{}';
+        const redirectUri = '{}';
+        const scope = '{}';
+        const codeChallenge = '{}';
+        const codeChallengeMethod = '{}';
+
+        async function approve() {{
+            try {{
+                const response = await fetch('/api/oauth/authorize', {{
+                    method: 'POST',
+                    headers: {{
+                        'Content-Type': 'application/json',
+                    }},
+                    credentials: 'include',
+                    body: JSON.stringify({{
+                        client_id: clientId,
+                        redirect_uri: redirectUri,
+                        scope: scope,
+                        approved: true,
+                        code_challenge: codeChallenge || undefined,
+                        code_challenge_method: codeChallengeMethod || undefined
+                    }})
+                }});
+
+                const data = await response.json();
+                if (data.code) {{
+                    window.location.href = `${{redirectUri}}?code=${{data.code}}`;
+                }} else {{
+                    alert('Error: ' + (data.error || 'Unknown error'));
+                }}
+            }} catch (e) {{
+                alert('Request failed: ' + e.message);
+            }}
+        }}
+
+        function deny() {{
+            window.location.href = `${{redirectUri}}?error=access_denied`;
+        }}
+    </script>
+</body>
+</html>
+        "#,
+            params.client_id,
+            params.client_id,
+            pubkey,
+            params.scope.as_deref().unwrap_or("sign_event"),
+            params.client_id,
+            params.redirect_uri,
+            params.scope.as_deref().unwrap_or("sign_event"),
+            params.code_challenge.as_deref().unwrap_or(""),
+            params.code_challenge_method.as_deref().unwrap_or(""),
+        )
+    } else {
+        // User not authenticated - show login/register form
+        format!(r#"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Login - Keycast</title>
+    <style>
+        body {{
+            font-family: -apple-system, sans-serif;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+        }}
+        .container {{
+            background: #2a2a2a;
+            padding: 40px;
+            border-radius: 12px;
+            max-width: 400px;
+            width: 100%;
+        }}
+        h1 {{ color: #bb86fc; margin-bottom: 10px; }}
+        .info {{ color: #888; font-size: 14px; margin-bottom: 20px; }}
+        .app-name {{ color: #03dac6; font-weight: bold; }}
+        .form-group {{
+            margin: 15px 0;
+        }}
+        label {{
+            display: block;
+            margin-bottom: 5px;
+            font-size: 14px;
+        }}
+        input {{
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #444;
+            border-radius: 6px;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            font-size: 14px;
+            box-sizing: border-box;
+        }}
+        input:focus {{
+            outline: none;
+            border-color: #bb86fc;
+        }}
+        button {{
+            width: 100%;
+            padding: 14px;
+            margin: 8px 0;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            background: #03dac6;
+            color: #000;
+        }}
+        button:hover {{
+            background: #04e5d4;
+        }}
+        .tab-container {{
+            display: flex;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #444;
+        }}
+        .tab {{
+            flex: 1;
+            padding: 10px;
+            text-align: center;
+            cursor: pointer;
+            color: #888;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+        }}
+        .tab.active {{
+            color: #bb86fc;
+            border-bottom-color: #bb86fc;
+        }}
+        .tab-content {{
+            display: none;
+        }}
+        .tab-content.active {{
+            display: block;
+        }}
+        .error {{
+            background: #cf6679;
+            color: #fff;
+            padding: 10px;
+            border-radius: 6px;
+            margin: 10px 0;
+            display: none;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Login to Keycast</h1>
+        <p class="info"><span class="app-name">{}</span> wants to access your Nostr account</p>
+
+        <div class="tab-container">
+            <div class="tab active" onclick="showTab('login')">Login</div>
+            <div class="tab" onclick="showTab('register')">Register</div>
+        </div>
+
+        <div id="error" class="error"></div>
+
+        <div id="login-tab" class="tab-content active">
+            <form onsubmit="handleLogin(event)">
+                <div class="form-group">
+                    <label>Email</label>
+                    <input type="email" id="login-email" required>
+                </div>
+                <div class="form-group">
+                    <label>Password</label>
+                    <input type="password" id="login-password" required>
+                </div>
+                <button type="submit">Login</button>
+            </form>
+        </div>
+
+        <div id="register-tab" class="tab-content">
+            <form onsubmit="handleRegister(event)">
+                <div class="form-group">
+                    <label>Email</label>
+                    <input type="email" id="register-email" required>
+                </div>
+                <div class="form-group">
+                    <label>Password</label>
+                    <input type="password" id="register-password" required minlength="8">
+                </div>
+                <button type="submit">Register</button>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        const clientId = '{}';
+        const redirectUri = '{}';
+        const scope = '{}';
+        const codeChallenge = '{}';
+        const codeChallengeMethod = '{}';
+
+        function showTab(tab) {{
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+
+            if (tab === 'login') {{
+                document.querySelector('.tab:nth-child(1)').classList.add('active');
+                document.getElementById('login-tab').classList.add('active');
+            }} else {{
+                document.querySelector('.tab:nth-child(2)').classList.add('active');
+                document.getElementById('register-tab').classList.add('active');
+            }}
+
+            hideError();
+        }}
+
+        function showError(message) {{
+            const errorEl = document.getElementById('error');
+            errorEl.textContent = message;
+            errorEl.style.display = 'block';
+        }}
+
+        function hideError() {{
+            document.getElementById('error').style.display = 'none';
+        }}
+
+        async function handleLogin(e) {{
+            e.preventDefault();
+            hideError();
+
+            const email = document.getElementById('login-email').value;
+            const password = document.getElementById('login-password').value;
+
+            try {{
+                const response = await fetch('/api/auth/login', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    credentials: 'include',
+                    body: JSON.stringify({{ email, password }})
+                }});
+
+                const data = await response.json();
+
+                if (!response.ok) {{
+                    showError(data.error || 'Login failed');
+                    return;
+                }}
+
+                // Cookie is set, reload page to show approval screen
+                window.location.reload();
+            }} catch (e) {{
+                showError('Request failed: ' + e.message);
+            }}
+        }}
+
+        async function handleRegister(e) {{
+            e.preventDefault();
+            hideError();
+
+            const email = document.getElementById('register-email').value;
+            const password = document.getElementById('register-password').value;
+
+            try {{
+                const response = await fetch('/api/auth/register', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    credentials: 'include',
+                    body: JSON.stringify({{ email, password }})
+                }});
+
+                const data = await response.json();
+
+                if (!response.ok) {{
+                    showError(data.error || 'Registration failed');
+                    return;
+                }}
+
+                // Cookie is set, reload page to show approval screen
+                window.location.reload();
+            }} catch (e) {{
+                showError('Request failed: ' + e.message);
+            }}
+        }}
+    </script>
+</body>
+</html>
+        "#,
+            params.client_id,
+            params.client_id,
+            params.redirect_uri,
+            params.scope.as_deref().unwrap_or("sign_event"),
+            params.code_challenge.as_deref().unwrap_or(""),
+            params.code_challenge_method.as_deref().unwrap_or(""),
+        )
+    };
+
+    Ok(Html(html).into_response())
 }
 
 /// POST /oauth/authorize
@@ -163,9 +632,9 @@ pub async fn authorize_post(
 
     let tenant_id = tenant.0.id;
 
-    // Extract user public key from JWT token in Authorization header
-    let user_public_key = super::auth::extract_user_from_token(&headers)
-        .map_err(|_| OAuthError::Unauthorized)?;
+    // Extract user public key from JWT cookie
+    let user_public_key = super::jwt_utils::extract_user_from_jwt_cookie(&headers)
+        .ok_or(OAuthError::Unauthorized)?;
 
     // Generate authorization code
     let code: String = rand::thread_rng()
@@ -285,9 +754,8 @@ pub async fn token(
     // Look up user's personal Nostr key from personal_keys table
     // We get the encrypted key to use as the bunker secret (for NIP-46 decryption + signing)
     let encrypted_user_key: Vec<u8> = sqlx::query_scalar(
-        "SELECT encrypted_secret_key FROM personal_keys WHERE tenant_id = $1 AND user_public_key = $2"
+        "SELECT encrypted_secret_key FROM personal_keys WHERE user_public_key = $1"
     )
-    .bind(tenant_id)
     .bind(&user_public_key)
     .fetch_one(pool)
     .await
@@ -309,9 +777,12 @@ pub async fn token(
     let relays_json = serde_json::to_string(&vec![relay_url])
         .map_err(|e| OAuthError::InvalidRequest(format!("Failed to serialize relays: {}", e)))?;
 
+    // Use ON CONFLICT to avoid duplicates per user/app combination
     sqlx::query(
         "INSERT INTO oauth_authorizations (tenant_id, user_public_key, application_id, bunker_public_key, bunker_secret, secret, relays, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (user_public_key, application_id)
+         DO UPDATE SET secret = $6, relays = $7, updated_at = $9"
     )
     .bind(tenant_id)
     .bind(&user_public_key)

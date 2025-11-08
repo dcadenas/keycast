@@ -4,6 +4,13 @@
         <h1 class="text-4xl md:text-5xl font-extrabold">Work Together</h1>
         <h1 class="text-2xl md:text-4xl font-light text-gray-400">without losing your keys</h1>
 
+        <!-- CTAs -->
+        <div class="flex flex-row gap-4 mt-8">
+            <a href="/register" class="button button-primary">Get Started</a>
+            <a href="/login" class="button button-secondary">Sign In</a>
+        </div>
+        <p class="text-gray-500 text-sm mt-4">Team admins: Use NIP-07 browser extension</p>
+
         <!-- Feature sections -->
         <div class="grid md:grid-cols-3 gap-8 max-w-6xl mx-auto mt-20 px-6">
             <!-- Team Management -->

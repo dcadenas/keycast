@@ -205,9 +205,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("examples");
 
     let app = Router::new()
-        // Root landing page
-        .route("/", get(landing_page))
-
         // Health checks at root level (for k8s/Cloud Run)
         .route("/health", get(health_check))
         .route("/healthz/startup", get(health_check))
@@ -224,7 +221,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nest_service("/examples", ServeDir::new(&examples_path))
 
         // SvelteKit frontend (fallback - catches all other routes)
-        .fallback_service(ServeDir::new(&web_build_dir));
+        // SPA mode: serve index.html for all non-file routes
+        .fallback_service(ServeDir::new(&web_build_dir).fallback(
+            axum::routing::get(|| async move {
+                let index_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap()
+                    .join("web/build/index.html");
+                match tokio::fs::read_to_string(&index_path).await {
+                    Ok(content) => Html(content).into_response(),
+                    Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
+                }
+            })
+        ));
 
     let api_addr = std::net::SocketAddr::from(([0, 0, 0, 0], api_port));
     tracing::info!("✔︎ API server ready on {}", api_addr);

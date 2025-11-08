@@ -276,12 +276,12 @@ pub(crate) fn extract_user_from_token(headers: &HeaderMap) -> Result<String, Aut
     Ok(token_data.claims.sub)
 }
 
-/// Register a new user with email and password
+/// Register a new user with email and password, sets session cookie
 pub async fn register(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
     Json(req): Json<RegisterRequest>,
-) -> Result<Json<RegisterResponse>, AuthError> {
+) -> Result<impl axum::response::IntoResponse, AuthError> {
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
     let tenant_id = tenant.0.id;
@@ -383,7 +383,7 @@ pub async fn register(
     // Create default OAuth application if it doesn't exist
     sqlx::query(
         "INSERT INTO oauth_applications (tenant_id, name, client_id, client_secret, redirect_uris, created_at, updated_at)
-         VALUES ($1, 'keycast-login', 'keycast-login', 'auto-approved', '[]', $2, $3)
+         VALUES ($1, 'keycast-ropc', 'keycast-ropc', 'auto-approved', '[]', $2, $3)
          ON CONFLICT (client_id, tenant_id) DO NOTHING"
     )
     .bind(tenant_id)
@@ -394,7 +394,7 @@ pub async fn register(
 
     // Get the application ID and policy_id
     let app_data: (i32, Option<i32>) = sqlx::query_as(
-        "SELECT id, policy_id FROM oauth_applications WHERE client_id = 'keycast-login' AND tenant_id = $1"
+        "SELECT id, policy_id FROM oauth_applications WHERE client_id = 'keycast-ropc' AND tenant_id = $1"
     )
     .bind(tenant_id)
     .fetch_one(&mut *tx)
@@ -499,20 +499,28 @@ pub async fn register(
 
     tracing::info!("Successfully registered user: {}", public_key.to_hex());
 
-    Ok(Json(RegisterResponse {
-        user_id: public_key.to_hex(),
-        email: req.email,
-        pubkey: public_key.to_hex(),
-        token,
-    }))
+    // Create response with cookie
+    let cookie = super::jwt_utils::create_jwt_cookie(&token);
+    let response = (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::SET_COOKIE, cookie)],
+        axum::Json(RegisterResponse {
+            user_id: public_key.to_hex(),
+            email: req.email,
+            pubkey: public_key.to_hex(),
+            token,
+        })
+    );
+
+    Ok(response)
 }
 
-/// Login with email and password, returns JWT token
+/// Login with email and password, returns JWT token and sets session cookie
 pub async fn login(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
     Json(req): Json<LoginRequest>,
-) -> Result<Json<LoginResponse>, AuthError> {
+) -> Result<impl axum::response::IntoResponse, AuthError> {
     let pool = &auth_state.state.db;
     let tenant_id = tenant.0.id;
     tracing::info!("Login attempt for email: {} in tenant: {}", req.email, tenant_id);
@@ -552,10 +560,115 @@ pub async fn login(
 
     tracing::info!("Successfully logged in user: {}", public_key);
 
-    Ok(Json(LoginResponse {
-        token,
-        pubkey: public_key,
-    }))
+    // Ensure keycast-ropc OAuth authorization exists (for peek and other first-party apps)
+    // This allows /api/user/bunker to work
+    let app_exists: Option<i32> = sqlx::query_scalar(
+        "SELECT id FROM oauth_applications WHERE client_id = 'keycast-ropc' AND tenant_id = $1"
+    )
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if app_exists.is_none() {
+        // Create keycast-ropc application if it doesn't exist
+        sqlx::query(
+            "INSERT INTO oauth_applications (tenant_id, name, client_id, client_secret, redirect_uris, created_at, updated_at)
+             VALUES ($1, 'keycast-ropc', 'keycast-ropc', 'auto-approved', '[]', $2, $3)
+             ON CONFLICT (client_id, tenant_id) DO NOTHING"
+        )
+        .bind(tenant_id)
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .execute(pool)
+        .await?;
+    }
+
+    // Check if user already has keycast-ropc authorization
+    let auth_exists: Option<i32> = sqlx::query_scalar(
+        "SELECT id FROM oauth_authorizations oa
+         WHERE oa.user_public_key = $1
+         AND oa.application_id = (SELECT id FROM oauth_applications WHERE client_id = 'keycast-ropc' AND tenant_id = $2)
+         AND oa.revoked_at IS NULL"
+    )
+    .bind(&public_key)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if auth_exists.is_none() {
+        // Get encrypted secret key from personal_keys table
+        let encrypted_secret: Vec<u8> = sqlx::query_scalar(
+            "SELECT encrypted_secret_key FROM personal_keys WHERE user_public_key = $1"
+        )
+        .bind(&public_key)
+        .fetch_one(pool)
+        .await?;
+
+        let connection_secret: String = rand::thread_rng()
+            .sample_iter(&rand::distributions::Alphanumeric)
+            .take(48)
+            .map(char::from)
+            .collect();
+
+        let app_id: i32 = sqlx::query_scalar(
+            "SELECT id FROM oauth_applications WHERE client_id = 'keycast-ropc' AND tenant_id = $1"
+        )
+        .bind(tenant_id)
+        .fetch_one(pool)
+        .await?;
+
+        let policy_id: i32 = sqlx::query_scalar(
+            "SELECT id FROM policies WHERE name = 'Standard Social (Default)' AND tenant_id = $1 LIMIT 1"
+        )
+        .bind(tenant_id)
+        .fetch_one(pool)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO oauth_authorizations
+             (tenant_id, user_public_key, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT (user_public_key, application_id) DO NOTHING"
+        )
+        .bind(tenant_id)
+        .bind(&public_key)
+        .bind(app_id)
+        .bind(&public_key)
+        .bind(&encrypted_secret)
+        .bind(&connection_secret)
+        .bind(r#"["wss://relay.damus.io", "wss://nos.lol", "wss://relay.nsec.app"]"#)
+        .bind(policy_id)
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .execute(pool)
+        .await?;
+
+        tracing::info!("Created keycast-ropc authorization for user: {}", public_key);
+
+        // Signal signer daemon to reload
+        let signal_file = std::path::Path::new("database/.reload_signal");
+        if let Some(parent) = signal_file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::File::create(signal_file) {
+            tracing::error!("Failed to create reload signal file: {}", e);
+        } else {
+            tracing::info!("Created reload signal for signer daemon");
+        }
+    }
+
+    // Create response with cookie
+    let cookie = super::jwt_utils::create_jwt_cookie(&token);
+    let response = (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::SET_COOKIE, cookie)],
+        axum::Json(LoginResponse {
+            token,
+            pubkey: public_key,
+        })
+    );
+
+    Ok(response)
 }
 
 /// Get bunker URL for the authenticated user
@@ -569,13 +682,13 @@ pub async fn get_bunker_url(
     let tenant_id = tenant.0.id;
     tracing::info!("Fetching bunker URL for user: {} in tenant: {}", user_pubkey, tenant_id);
 
-    // Get the user's OAuth authorization bunker URL for keycast-login
+    // Get the user's OAuth authorization bunker URL for keycast-ropc
     let result: Option<(String, String)> = sqlx::query_as(
         "SELECT oa.bunker_public_key, oa.secret FROM oauth_authorizations oa
          JOIN users u ON oa.user_public_key = u.public_key
          WHERE oa.user_public_key = $1
          AND u.tenant_id = $2
-         AND oa.application_id = (SELECT id FROM oauth_applications WHERE client_id = 'keycast-login' AND tenant_id = $2)
+         AND oa.application_id = (SELECT id FROM oauth_applications WHERE client_id = 'keycast-ropc' AND tenant_id = $2)
          ORDER BY oa.created_at DESC LIMIT 1"
     )
     .bind(&user_pubkey)
@@ -868,7 +981,7 @@ pub async fn update_profile(
 #[derive(Debug, Serialize)]
 pub struct BunkerSession {
     pub application_name: String,
-    pub application_id: Option<i64>,
+    pub application_id: Option<i32>,
     pub bunker_pubkey: String,
     pub secret: String,
     pub client_pubkey: Option<String>,
@@ -888,26 +1001,28 @@ pub async fn list_sessions(
     State(pool): State<PgPool>,
     headers: HeaderMap,
 ) -> Result<Json<BunkerSessionsResponse>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers)?;
+    // Try cookie auth first, then Bearer token
+    let user_pubkey = super::jwt_utils::extract_user_from_jwt_cookie(&headers)
+        .ok_or(AuthError::MissingToken)
+        .or_else(|_| extract_user_from_token(&headers))?;
     let tenant_id = tenant.0.id;
     tracing::info!("Listing bunker sessions for user: {} in tenant: {}", user_pubkey, tenant_id);
 
     // Get OAuth authorizations with application details and activity stats
-    let oauth_sessions: Vec<(String, i64, String, String, Option<String>, String, Option<String>, Option<i64>)> = sqlx::query_as(
+    let oauth_sessions: Vec<(String, i32, String, String, String, Option<String>, Option<i64>)> = sqlx::query_as(
         "SELECT
             COALESCE(a.name, 'Personal Bunker') as name,
             oa.application_id,
             oa.bunker_public_key,
             oa.secret,
-            oa.client_public_key,
-            oa.created_at,
-            (SELECT MAX(created_at) FROM signing_activity WHERE bunker_secret = oa.secret) as last_activity,
+            oa.created_at::text,
+            (SELECT MAX(created_at)::text FROM signing_activity WHERE bunker_secret = oa.secret) as last_activity,
             (SELECT COUNT(*) FROM signing_activity WHERE bunker_secret = oa.secret) as activity_count
          FROM oauth_authorizations oa
          LEFT JOIN oauth_applications a ON oa.application_id = a.id
          JOIN users u ON oa.user_public_key = u.public_key
-         WHERE oa.user_public_key = ?1
-           AND u.tenant_id = ?2
+         WHERE oa.user_public_key = $1
+           AND u.tenant_id = $2
            AND oa.revoked_at IS NULL
          ORDER BY oa.created_at DESC"
     )
@@ -918,12 +1033,12 @@ pub async fn list_sessions(
 
     let sessions = oauth_sessions
         .into_iter()
-        .map(|(name, app_id, bunker_pubkey, secret, client_pubkey, created_at, last_activity, activity_count)| BunkerSession {
+        .map(|(name, app_id, bunker_pubkey, secret, created_at, last_activity, activity_count)| BunkerSession {
             application_name: name,
             application_id: Some(app_id),
             bunker_pubkey,
             secret,
-            client_pubkey,
+            client_pubkey: None,  // client_public_key column doesn't exist
             created_at,
             last_activity,
             activity_count: activity_count.unwrap_or(0),
@@ -1015,16 +1130,19 @@ pub async fn revoke_session(
     headers: HeaderMap,
     Json(req): Json<RevokeSessionRequest>,
 ) -> Result<Json<RevokeSessionResponse>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers)?;
+    // Try cookie auth first, then Bearer token
+    let user_pubkey = super::jwt_utils::extract_user_from_jwt_cookie(&headers)
+        .ok_or(AuthError::MissingToken)
+        .or_else(|_| extract_user_from_token(&headers))?;
     let tenant_id = tenant.0.id;
     tracing::info!("Revoking bunker session for user: {} in tenant: {}", user_pubkey, tenant_id);
 
     // Verify this bunker session belongs to the user in this tenant and revoke it
     let result = sqlx::query(
         "UPDATE oauth_authorizations
-         SET revoked_at = ?1, updated_at = ?2
-         WHERE secret = ?3 AND user_public_key = ?4 AND revoked_at IS NULL
-         AND user_public_key IN (SELECT public_key FROM users WHERE tenant_id = ?5)"
+         SET revoked_at = $1, updated_at = $2
+         WHERE secret = $3 AND user_public_key = $4 AND revoked_at IS NULL
+         AND user_public_key IN (SELECT public_key FROM users WHERE tenant_id = $5)"
     )
     .bind(Utc::now())
     .bind(Utc::now())
