@@ -19,11 +19,11 @@ use std::env;
 use keycast_core::types::permission::Permission;
 use keycast_core::traits::CustomPermission;
 
-const TOKEN_EXPIRY_HOURS: i64 = 24;
+pub const TOKEN_EXPIRY_HOURS: i64 = 24;
 const EMAIL_VERIFICATION_EXPIRY_HOURS: i64 = 24;
 const PASSWORD_RESET_EXPIRY_HOURS: i64 = 1;
 
-fn get_jwt_secret() -> String {
+pub fn get_jwt_secret() -> String {
     env::var("JWT_SECRET").unwrap_or_else(|_| {
         eprintln!("WARNING: JWT_SECRET not set in environment, using insecure default");
         "insecure-dev-secret-change-in-production".to_string()
@@ -40,9 +40,9 @@ fn generate_secure_token() -> String {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String,  // user public key
-    exp: usize,   // expiration time
+pub struct Claims {
+    pub sub: String,  // user public key
+    pub exp: usize,   // expiration time
 }
 
 #[derive(Debug, Deserialize)]

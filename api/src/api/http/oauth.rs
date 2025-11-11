@@ -9,8 +9,11 @@ use axum::{
 };
 use base64::Engine;
 use chrono::{Duration, Utc};
+use jsonwebtoken::{encode, EncodingKey, Header};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+
+use super::auth::{Claims, get_jwt_secret, TOKEN_EXPIRY_HOURS};
 
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeRequest {
@@ -39,9 +42,17 @@ pub struct TokenRequest {
     pub code_verifier: Option<String>,
 }
 
+/// RFC 6749 Section 5.1 - Successful Response
+/// All grant types return consistent format with Keycast extension (bunker_url)
+/// https://datatracker.ietf.org/doc/html/rfc6749#section-5.1
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
-    pub bunker_url: String,
+    pub bunker_url: String,           // Keycast extension - NIP-46 credential
+    pub access_token: String,          // RFC 6749 required - JWT for API calls
+    pub token_type: String,            // RFC 6749 required - "Bearer"
+    pub expires_in: i64,               // RFC 6749 recommended - JWT expiry (seconds)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,         // RFC 6749 optional - granted permissions
 }
 
 #[derive(Debug)]
@@ -812,7 +823,28 @@ pub async fn token(
         connection_secret
     );
 
-    Ok(Json(TokenResponse { bunker_url }))
+    // Generate JWT access token for API calls (RFC 6749 compliant response)
+    let exp = (Utc::now() + Duration::hours(TOKEN_EXPIRY_HOURS)).timestamp() as usize;
+    let claims = Claims {
+        sub: user_public_key.clone(),
+        exp,
+    };
+
+    let jwt_secret = get_jwt_secret();
+    let access_token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(jwt_secret.as_ref()),
+    )
+    .map_err(|e| OAuthError::InvalidRequest(format!("JWT encoding error: {}", e)))?;
+
+    Ok(Json(TokenResponse {
+        bunker_url,
+        access_token,
+        token_type: "Bearer".to_string(),
+        expires_in: TOKEN_EXPIRY_HOURS * 3600,  // Convert hours to seconds
+        scope: Some(_scope.to_string()),
+    }))
 }
 
 // ============================================================================
