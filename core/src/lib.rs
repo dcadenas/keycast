@@ -1,3 +1,4 @@
+pub mod authorization_channel;
 pub mod custom_permissions;
 pub mod database;
 pub mod encryption;

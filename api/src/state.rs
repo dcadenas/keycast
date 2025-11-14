@@ -15,12 +15,15 @@ pub enum StateError {
     KeyManagerNotInitialized,
 }
 
+/// Map of bunker public keys to their signing handlers
+pub type SignerHandlersMap = HashMap<String, Arc<dyn SigningHandler>>;
+
 pub struct KeycastState {
     pub db: PgPool,
     pub key_manager: Arc<Box<dyn KeyManager>>,
     /// Optional signer handlers for unified mode
     /// Maps bunker_public_key -> SigningHandler trait object
-    pub signer_handlers: Option<Arc<RwLock<HashMap<String, Arc<dyn SigningHandler>>>>>,
+    pub signer_handlers: Option<Arc<RwLock<SignerHandlersMap>>>,
 }
 
 pub static KEYCAST_STATE: OnceCell<Arc<KeycastState>> = OnceCell::new();

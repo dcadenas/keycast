@@ -52,10 +52,7 @@ spec:
               value: "https://oauth.divine.video"
             - name: FROM_EMAIL
               value: "noreply@divine.video"
-            - name: JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: keycast-jwt-secret
+                  name: keycast-ucan-secret
                   key: latest
             - name: SENDGRID_API_KEY
               valueFrom:

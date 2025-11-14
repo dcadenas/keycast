@@ -10,16 +10,6 @@ edition = "2021"
 name = "keycast_signer"
 path = "src/lib.rs"
 
-# The unified signer binary handles all authorizations in a single process
-[[bin]]
-name = "keycast_signer"
-path = "src/main.rs"
-
-# True unified binary - runs API + Signer in same process with shared state
-[[bin]]
-name = "keycast"
-path = "src/bin/keycast.rs"
-
 [dependencies]
 keycast_core = { path = "../core" }
 keycast_api = { path = "../api" }
@@ -41,3 +31,4 @@ tower-http = { version = "0.6", features = ["trace", "util", "cors", "fs"] }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

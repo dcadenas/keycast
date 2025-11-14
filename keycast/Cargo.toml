@@ -1,0 +1,28 @@
+[package]
+name = "keycast"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "keycast"
+path = "src/main.rs"
+
+[dependencies]
+keycast_core = { path = "../core" }
+keycast_api = { path = "../api" }
+keycast_signer = { path = "../signer" }
+
+# Web framework
+axum = { version = "0.7", features = ["macros", "tokio"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+dotenv = "0.15"
+
+[dev-dependencies]

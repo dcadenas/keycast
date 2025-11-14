@@ -63,8 +63,8 @@ All notable changes to this project will be documented in this file.
 
 ### Documentation
 - Personal authentication system with email/password registration and login
-- JWT-based authentication with 24-hour token expiration
-- Automatic login after registration (returns JWT token immediately)
+- UCAN-based authentication with 24-hour token expiration
+- Automatic login after registration (returns UCAN token immediately)
 - NIP-46 bunker URL generation for registered users
 - Database migrations for personal authentication (email, password_hash, personal_keys table)
 - GCP KMS integration for encrypting user secret keys
@@ -81,7 +81,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - Updated CORS from single origin to allow all origins for embeddable auth
-- Registration endpoint now returns JWT token for seamless user experience
+- Registration endpoint now returns UCAN token for seamless user experience
 - **BREAKING**: Refactored signer from multi-process (one per authorization) to unified single-process architecture
 - OAuth authorizations now use user's personal key instead of generating random keys
 - OAuth bunker URLs use user's public key as bunker_public_key with unique connection secret per app
@@ -90,6 +90,6 @@ All notable changes to this project will be documented in this file.
 ### Security
 - Passwords hashed with bcrypt (DEFAULT_COST)
 - User secret keys encrypted with GCP KMS or file-based key manager
-- JWT tokens for secure session management
+- UCAN tokens for secure session management
 - Unique bunker secrets (64-character alphanumeric) for NIP-46 connections
 - OAuth authorizations support per-app revocation via unique bunker URL per app

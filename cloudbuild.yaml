@@ -38,7 +38,7 @@ steps:
       - '--set-env-vars'
       - 'NODE_ENV=production,RUST_LOG=info,WEB_BUILD_DIR=/app/web,USE_GCP_KMS=true,GCP_PROJECT_ID=${PROJECT_ID},CORS_ALLOWED_ORIGIN=https://oauth.divine.video,APP_URL=https://oauth.divine.video,FROM_EMAIL=noreply@divine.video'
       - '--update-secrets'
-      - 'MASTER_KEY_PATH=keycast-master-key:latest,SENDGRID_API_KEY=keycast-sendgrid-api-key:latest,JWT_SECRET=keycast-jwt-secret:latest,DATABASE_URL=keycast-database-url:latest'
+      - 'MASTER_KEY_PATH=keycast-master-key:latest,SENDGRID_API_KEY=keycast-sendgrid-api-key:latest,DATABASE_URL=keycast-database-url:latest'
 
   # Smoke tests - verify deployment
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'

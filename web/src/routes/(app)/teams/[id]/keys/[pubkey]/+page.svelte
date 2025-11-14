@@ -41,32 +41,52 @@ let keyUserProfile: NDKUserProfile | null = $state(null);
 
 $effect(() => {
     if (user?.pubkey && !unsignedAuthEvent) {
-        api.buildUnsignedAuthEvent(
-            `/teams/${id}/keys/${pubkey}`,
-            "GET",
-            user.pubkey,
-        ).then(async (event) => {
-            unsignedAuthEvent = event;
-            if (unsignedAuthEvent) {
-                if (!ndk.signer) {
-                    ndk.signer = new NDKNip07Signer();
-                }
-                await unsignedAuthEvent.sign();
-                encodedAuthEvent = `Nostr ${btoa(JSON.stringify(unsignedAuthEvent))}`;
-                api.get(`/teams/${id}/keys/${pubkey}`, {
-                    headers: { Authorization: encodedAuthEvent },
-                })
-                    .then((teamKeyResponse) => {
-                        key = (teamKeyResponse as KeyWithRelations).stored_key;
-                        team = (teamKeyResponse as KeyWithRelations).team;
-                        authorizations = (teamKeyResponse as KeyWithRelations)
-                            .authorizations;
+        const authMethod = getCurrentUser()?.authMethod;
+        let authHeaders: Record<string, string> = {};
+
+        if (authMethod === 'nip07') {
+            api.buildUnsignedAuthEvent(
+                `/teams/${id}/keys/${pubkey}`,
+                "GET",
+                user.pubkey,
+            ).then(async (event) => {
+                unsignedAuthEvent = event;
+                if (unsignedAuthEvent) {
+                    if (!ndk.signer) {
+                        ndk.signer = new NDKNip07Signer();
+                    }
+                    await unsignedAuthEvent.sign();
+                    encodedAuthEvent = `Nostr ${btoa(JSON.stringify(unsignedAuthEvent))}`;
+                    authHeaders.Authorization = encodedAuthEvent;
+                    api.get(`/teams/${id}/keys/${pubkey}`, {
+                        headers: authHeaders,
                     })
-                    .finally(() => {
-                        isLoading = false;
-                    });
-            }
-        });
+                        .then((teamKeyResponse) => {
+                            key = (teamKeyResponse as KeyWithRelations).stored_key;
+                            team = (teamKeyResponse as KeyWithRelations).team;
+                            authorizations = (teamKeyResponse as KeyWithRelations)
+                                .authorizations;
+                        })
+                        .finally(() => {
+                            isLoading = false;
+                        });
+                }
+            });
+        } else {
+            // Cookie auth (sent automatically via credentials: 'include')
+            api.get(`/teams/${id}/keys/${pubkey}`, {
+                headers: authHeaders,
+            })
+                .then((teamKeyResponse) => {
+                    key = (teamKeyResponse as KeyWithRelations).stored_key;
+                    team = (teamKeyResponse as KeyWithRelations).team;
+                    authorizations = (teamKeyResponse as KeyWithRelations)
+                        .authorizations;
+                })
+                .finally(() => {
+                    isLoading = false;
+                });
+        }
     }
 
     if (key && !keyUserProfile) {
@@ -85,20 +105,25 @@ async function removeKey() {
     )
         return;
 
-    const authEvent = await api.buildUnsignedAuthEvent(
-        `/teams/${id}/keys/${pubkey}`,
-        "DELETE",
-        user?.pubkey,
-    );
-    if (!ndk.signer) {
-        ndk.signer = new NDKNip07Signer();
+    const authMethod = getCurrentUser()?.authMethod;
+    let authHeaders: Record<string, string> = {};
+
+    if (authMethod === 'nip07') {
+        const authEvent = await api.buildUnsignedAuthEvent(
+            `/teams/${id}/keys/${pubkey}`,
+            "DELETE",
+            user?.pubkey,
+        );
+        if (!ndk.signer) {
+            ndk.signer = new NDKNip07Signer();
+        }
+        await authEvent?.sign();
+        authHeaders.Authorization = `Nostr ${btoa(JSON.stringify(authEvent))}`;
     }
-    await authEvent?.sign();
+    // Otherwise cookie auth (sent automatically via credentials: 'include')
 
     api.delete(`/teams/${id}/keys/${pubkey}`, {
-        headers: {
-            Authorization: `Nostr ${btoa(JSON.stringify(authEvent))}`,
-        },
+        headers: authHeaders,
     })
         .then(() => {
             toast.success("Key removed successfully");

@@ -3,19 +3,27 @@
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response, Html},
     Form, Json,
 };
+use base64::Engine;
+use bcrypt::verify;
 use chrono::{Duration, Utc};
+use nostr_sdk::{Keys, ToBech32};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+
+// Import constants and helpers from auth module
+use super::auth::TOKEN_EXPIRY_HOURS;
 
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeRequest {
     pub client_id: String,
     pub redirect_uri: String,
     pub scope: Option<String>,
+    pub code_challenge: Option<String>,
+    pub code_challenge_method: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -24,18 +32,67 @@ pub struct ApproveRequest {
     pub redirect_uri: String,
     pub scope: String,
     pub approved: bool,
+    pub code_challenge: Option<String>,
+    pub code_challenge_method: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct TokenRequest {
+    pub grant_type: Option<String>,  // "authorization_code" only
     pub code: String,
     pub client_id: String,
     pub redirect_uri: String,
+    pub code_verifier: Option<String>,  // For PKCE
 }
 
+/// Generate UCAN token signed by user's key
+/// Note: Currently using auth::generate_ucan_token instead, but keeping this for potential future use
+#[allow(dead_code)]
+async fn generate_ucan_token(
+    user_keys: &Keys,
+    tenant_id: i64,
+    email: &str,
+) -> Result<String, OAuthError> {
+    use crate::ucan_auth::{NostrKeyMaterial, nostr_pubkey_to_did};
+    use ucan::builder::UcanBuilder;
+    use serde_json::json;
+
+    let key_material = NostrKeyMaterial::from_keys(user_keys.clone());
+    let user_did = nostr_pubkey_to_did(&user_keys.public_key());
+
+    // Create facts as a single JSON object
+    let facts = json!({
+        "tenant_id": tenant_id,
+        "email": email,
+    });
+
+    let ucan = UcanBuilder::default()
+        .issued_by(&key_material)
+        .for_audience(&user_did)  // Self-issued
+        .with_lifetime((TOKEN_EXPIRY_HOURS * 3600) as u64)  // 24 hours in seconds
+        .with_fact(facts)
+        .build()
+        .map_err(|e| OAuthError::InvalidRequest(format!("Failed to build UCAN: {}", e)))?
+        .sign()
+        .await
+        .map_err(|e| OAuthError::InvalidRequest(format!("Failed to sign UCAN: {}", e)))?;
+
+    ucan.encode()
+        .map_err(|e| OAuthError::InvalidRequest(format!("Failed to encode UCAN: {}", e)))
+}
+
+/// RFC 6749 Section 5.1 - Successful Response (Keycast variant)
+///
+/// Returns bunker URL for NIP-46 remote signing (no admin access token)
+///
+/// See: <https://datatracker.ietf.org/doc/html/rfc6749#section-5.1>
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
-    pub bunker_url: String,
+    pub bunker_url: String,           // Keycast extension - NIP-46 credential
+    pub token_type: String,            // RFC 6749 required - "Bearer"
+    pub expires_in: i64,               // RFC 6749 recommended - bunker doesn't expire (0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,         // RFC 6749 optional - granted permissions
 }
 
 #[derive(Debug)]
@@ -51,7 +108,7 @@ impl IntoResponse for OAuthError {
         let (status, message) = match self {
             OAuthError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
-                "Please log in to continue.".to_string()
+                "Invalid email or password. Please check your credentials and try again.".to_string()
             ),
             OAuthError::InvalidRequest(msg) => (
                 StatusCode::BAD_REQUEST,
@@ -85,15 +142,846 @@ impl From<sqlx::Error> for OAuthError {
     }
 }
 
+/// Validate PKCE code_verifier against stored code_challenge
+/// Implements RFC 7636 validation for both S256 and plain methods
+fn validate_pkce(
+    code_verifier: &str,
+    code_challenge: &str,
+    code_challenge_method: &str,
+) -> Result<(), OAuthError> {
+    match code_challenge_method {
+        "S256" => {
+            // Compute SHA256 hash of code_verifier
+            let hash = sha256::digest(code_verifier);
+
+            // Convert hex to bytes then base64url encode
+            let hash_bytes = hex::decode(&hash)
+                .map_err(|e| OAuthError::InvalidRequest(format!("Hash decode error: {}", e)))?;
+
+            // Base64 URL-safe encoding (no padding)
+            let computed_challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(&hash_bytes);
+
+            if computed_challenge != code_challenge {
+                tracing::warn!("PKCE validation failed: computed {} != stored {}",
+                    &computed_challenge[..16], &code_challenge[..16]);
+                return Err(OAuthError::InvalidRequest(
+                    "Invalid code_verifier: PKCE validation failed".to_string()
+                ));
+            }
+            Ok(())
+        }
+        "plain" => {
+            if code_verifier != code_challenge {
+                return Err(OAuthError::InvalidRequest(
+                    "Invalid code_verifier: plain PKCE validation failed".to_string()
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(OAuthError::InvalidRequest(
+            format!("Unsupported code_challenge_method: {}", code_challenge_method)
+        )),
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthStatusResponse {
+    pub authenticated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<String>,
+}
+
+/// GET /oauth/auth-status
+/// Check if user has a valid session cookie
+pub async fn auth_status(
+    headers: HeaderMap,
+) -> Result<Json<AuthStatusResponse>, OAuthError> {
+    if let Some(user_pubkey) = super::auth::extract_ucan_from_cookie(&headers).and_then(|token| {
+        // Parse UCAN from string using ucan_auth helper
+        crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), 0).ok().map(|(pubkey, _)| pubkey)
+    }) {
+        Ok(Json(AuthStatusResponse {
+            authenticated: true,
+            pubkey: Some(user_pubkey),
+        }))
+    } else {
+        Ok(Json(AuthStatusResponse {
+            authenticated: false,
+            pubkey: None,
+        }))
+    }
+}
+
 /// GET /oauth/authorize
-/// Shows authorization approval page (or redirects to login if not authenticated)
+/// Shows login form if not authenticated, or auto-approves if already authorized, or shows approval page
 pub async fn authorize_get(
-    State(_auth_state): State<super::routes::AuthState>,
-    Query(_params): Query<AuthorizeRequest>,
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
+    Query(params): Query<AuthorizeRequest>,
 ) -> Result<Response, OAuthError> {
-    // TODO: Extract user from session/JWT
-    // For now, return OK to pass the test structure
-    Ok((StatusCode::OK, "Authorization page").into_response())
+    use axum::response::Html;
+
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+
+    // Check if user is authenticated via cookie and extract user data
+    let user_data = super::auth::extract_ucan_from_cookie(&headers)
+        .and_then(|token| {
+            // Parse UCAN from string using ucan_auth helper (tenant validation done later)
+            crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id)
+                .ok()
+                .map(|(pubkey, ucan)| {
+                    // Extract relays from UCAN facts
+                    let relays: Vec<String> = ucan.facts()
+                        .iter()
+                        .filter_map(|fact| {
+                            fact.get("relays")
+                                .and_then(|r| r.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                })
+                        })
+                        .next()
+                        .unwrap_or_default();
+
+                    (pubkey, relays)
+                })
+        });
+
+    let user_pubkey = user_data.as_ref().map(|(pk, _)| pk.clone());
+    let user_relays = user_data.as_ref().map(|(_, relays)| relays.clone()).unwrap_or_default();
+
+    // Validate that the user actually exists in the database
+    let (user_pubkey, clear_cookie) = if let Some(ref pubkey) = user_pubkey {
+        // Check if user exists
+        let exists: Option<(String,)> = sqlx::query_as(
+            "SELECT public_key FROM users WHERE public_key = $1 AND tenant_id = $2"
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(pool)
+        .await?;
+
+        if exists.is_none() {
+            tracing::warn!("UCAN cookie has pubkey {} but user doesn't exist in tenant {}, clearing stale cookie", pubkey, tenant_id);
+            (None, true)  // User was deleted, clear the cookie
+        } else {
+            (user_pubkey, false)
+        }
+    } else {
+        (None, false)
+    };
+
+    // If authenticated, check if they've already authorized this app
+    if let Some(ref pubkey) = user_pubkey {
+        // Get application ID
+        let app_id: Option<i32> = sqlx::query_scalar(
+            "SELECT id FROM oauth_applications WHERE tenant_id = $1 AND client_id = $2"
+        )
+        .bind(tenant_id)
+        .bind(&params.client_id)
+        .fetch_optional(pool)
+        .await?;
+
+        tracing::info!("Auto-approve check: client_id={}, app_id={:?}, user_pubkey={}",
+            params.client_id, app_id, pubkey);
+
+        if let Some(app_id) = app_id {
+            // Check if user has already authorized this app
+            let existing_auth: Option<(i32,)> = sqlx::query_as(
+                "SELECT id FROM oauth_authorizations
+                 WHERE tenant_id = $1 AND user_public_key = $2 AND application_id = $3"
+            )
+            .bind(tenant_id)
+            .bind(pubkey)
+            .bind(app_id)
+            .fetch_optional(pool)
+            .await?;
+
+            tracing::info!("Existing authorization check: found={}", existing_auth.is_some());
+
+            if existing_auth.is_some() {
+                tracing::info!("Auto-approving: user has already authorized this app");
+                // Auto-approve: generate code and send directly to parent window
+                let code: String = rand::thread_rng()
+                    .sample_iter(&rand::distributions::Alphanumeric)
+                    .take(32)
+                    .map(char::from)
+                    .collect();
+
+                let expires_at = Utc::now() + Duration::minutes(10);
+
+                sqlx::query(
+                    "INSERT INTO oauth_codes (tenant_id, code, user_public_key, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+                )
+                .bind(tenant_id)
+                .bind(&code)
+                .bind(pubkey)
+                .bind(app_id)
+                .bind(&params.redirect_uri)
+                .bind(params.scope.as_deref().unwrap_or("sign_event"))
+                .bind(&params.code_challenge)
+                .bind(&params.code_challenge_method)
+                .bind(expires_at)
+                .bind(Utc::now())
+                .execute(pool)
+                .await?;
+
+                // Return inline HTML that sends code to parent and closes immediately (no flicker)
+                // Extract origin from redirect_uri for postMessage
+                let redirect_origin = params.redirect_uri
+                    .split('/')
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join("/");
+
+                let auto_approve_html = format!(r#"
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body>
+<script>
+window.opener.postMessage({{ type: 'oauth_callback', code: '{}' }}, '{}');
+window.close();
+</script>
+</body>
+</html>
+                "#, code, redirect_origin);
+
+                return Ok(Html(auto_approve_html).into_response());
+            }
+        }
+    }
+
+    let html = if let Some(pubkey) = user_pubkey {
+        // Convert pubkey to npub for display
+        let npub = nostr_sdk::PublicKey::from_hex(&pubkey)
+            .ok()
+            .and_then(|pk| pk.to_bech32().ok())
+            .unwrap_or_else(|| pubkey.clone());
+
+        // Use user's relays or fallback to default popular relays
+        let relays_for_profile = if user_relays.is_empty() {
+            vec![
+                "wss://relay.damus.io".to_string(),
+                "wss://nos.lol".to_string(),
+                "wss://relay.nostr.band".to_string(),
+            ]
+        } else {
+            user_relays
+        };
+
+        let relays_json = serde_json::to_string(&relays_for_profile)
+            .unwrap_or_else(|_| "[]".to_string());
+
+        // User is authenticated - show approval screen
+        format!(r#"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Authorize {}</title>
+    <script src="https://unpkg.com/nostr-tools@2.7.2/lib/nostr.bundle.js"
+            integrity="sha384-xf02s8T/9FVjKBW2IA0yLDYKsosKPVCYxGwQskHkNKZ/LpB9oM7yZdP5lqQ0ZC2f"
+            crossorigin="anonymous"></script>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }}
+        .container {{
+            background: #1a1a1a;
+            border: 1px solid #333;
+            padding: 3rem;
+            border-radius: 12px;
+            max-width: 450px;
+            width: 100%;
+        }}
+        h1 {{
+            color: #bb86fc;
+            margin: 0 0 0.5rem 0;
+            font-size: 2rem;
+        }}
+        .info {{
+            color: #999;
+            font-size: 1rem;
+            margin: 0 0 2rem 0;
+        }}
+        .app-name {{
+            color: #bb86fc;
+            font-weight: 600;
+        }}
+        .user-info {{
+            background: #0a0a0a;
+            border: 1px solid #444;
+            padding: 1rem;
+            border-radius: 6px;
+            margin: 1.5rem 0;
+        }}
+        .user-info strong {{
+            color: #e0e0e0;
+            font-size: 0.9rem;
+            display: block;
+            margin-bottom: 0.75rem;
+        }}
+        .profile-container {{
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }}
+        #avatar {{
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            object-fit: cover;
+            border: 2px solid #444;
+            flex-shrink: 0;
+            display: none;
+        }}
+        #avatar.loaded {{
+            display: block;
+        }}
+        .profile-info {{
+            flex: 1;
+            min-width: 0;
+        }}
+        #display-name {{
+            color: #e0e0e0;
+            font-weight: 600;
+            font-size: 1rem;
+            margin-bottom: 0.25rem;
+            word-break: break-word;
+            overflow-wrap: break-word;
+        }}
+        #npub-fallback {{
+            color: #03dac6;
+            font-family: 'Courier New', monospace;
+            font-size: 0.75rem;
+            word-break: break-all;
+            opacity: 0.5;
+            display: none;
+        }}
+        #npub-fallback.show {{
+            display: block;
+        }}
+        .loading {{
+            color: #999;
+            font-size: 0.9rem;
+            font-style: italic;
+        }}
+        .scope {{
+            background: #0a0a0a;
+            border: 1px solid #444;
+            padding: 1rem;
+            border-radius: 6px;
+            margin: 1.5rem 0;
+        }}
+        .scope strong {{
+            color: #e0e0e0;
+            font-size: 0.9rem;
+        }}
+        .scope small {{
+            color: #999;
+        }}
+        button {{
+            width: 100%;
+            padding: 0.75rem;
+            margin: 0.5rem 0;
+            border: none;
+            border-radius: 6px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }}
+        .approve {{ background: #bb86fc; color: #000; }}
+        .approve:hover {{ background: #cb96fc; }}
+        .deny {{ background: #cf6679; color: #fff; }}
+        .deny:hover {{ background: #df7689; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Authorize Access</h1>
+        <p class="info"><span class="app-name">{}</span> wants to access your Nostr account</p>
+
+        <div class="user-info">
+            <strong>Logged in as:</strong>
+            <div class="profile-container">
+                <img id="avatar" alt="Profile picture">
+                <div class="profile-info">
+                    <div id="display-name" class="loading">Loading profile...</div>
+                    <div id="npub-fallback">{}</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="scope">
+            <strong>Permissions requested:</strong><br>
+            <small>{}</small>
+        </div>
+
+        <button class="approve" onclick="approve()">✓ Approve</button>
+        <button class="deny" onclick="deny()">✗ Deny</button>
+    </div>
+
+    <script>
+        const clientId = '{}';
+        const redirectUri = '{}';
+        const scope = '{}';
+        const codeChallenge = '{}';
+        const codeChallengeMethod = '{}';
+        const userPubkey = '{}';
+        const userRelays = {};
+
+        // Load profile from Nostr relays
+        async function loadProfile() {{
+            try {{
+                if (!window.NostrTools) {{
+                    console.warn('nostr-tools not loaded, skipping profile fetch');
+                    // Show npub without profile fetching
+                    document.getElementById('display-name').textContent = document.getElementById('npub-fallback').textContent;
+                    document.getElementById('display-name').classList.remove('loading');
+                    return;
+                }}
+
+                const {{ SimplePool }} = window.NostrTools;
+                const pool = new SimplePool();
+
+                console.log('Fetching profile for', userPubkey, 'from', userRelays);
+
+                // Fetch kind 0 (metadata) event with 3 second timeout
+                const events = await Promise.race([
+                    pool.querySync(userRelays, {{
+                        kinds: [0],
+                        authors: [userPubkey],
+                        limit: 1
+                    }}),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000))
+                ]);
+
+                pool.close(userRelays);
+
+                if (events && events.length > 0) {{
+                    const profile = JSON.parse(events[0].content);
+                    console.log('Profile loaded:', profile);
+
+                    // Update display name
+                    const displayName = profile.display_name || profile.name;
+                    if (displayName) {{
+                        // Show profile name + npub below for verification
+                        document.getElementById('display-name').textContent = displayName;
+                        document.getElementById('display-name').classList.remove('loading');
+                        document.getElementById('npub-fallback').classList.add('show');
+                    }} else {{
+                        // No name in profile, just show npub (no duplication)
+                        document.getElementById('display-name').textContent = document.getElementById('npub-fallback').textContent;
+                        document.getElementById('display-name').classList.remove('loading');
+                    }}
+
+                    // Update avatar if available
+                    if (profile.picture) {{
+                        const avatarEl = document.getElementById('avatar');
+                        avatarEl.src = profile.picture;
+                        avatarEl.classList.add('loaded');
+                        avatarEl.onerror = () => {{
+                            avatarEl.classList.remove('loaded');
+                        }};
+                    }}
+                }} else {{
+                    // No profile found, show npub in display-name only
+                    console.log('No profile found, using npub');
+                    document.getElementById('display-name').textContent = document.getElementById('npub-fallback').textContent;
+                    document.getElementById('display-name').classList.remove('loading');
+                }}
+            }} catch (e) {{
+                // Error loading profile, show npub in display-name only
+                console.warn('Could not load profile:', e);
+                document.getElementById('display-name').textContent = document.getElementById('npub-fallback').textContent;
+                document.getElementById('display-name').classList.remove('loading');
+            }}
+        }}
+
+        // Load profile on page load
+        window.addEventListener('load', loadProfile);
+
+        async function approve() {{
+            try {{
+                const response = await fetch('/api/oauth/authorize', {{
+                    method: 'POST',
+                    headers: {{
+                        'Content-Type': 'application/json',
+                    }},
+                    credentials: 'include',
+                    body: JSON.stringify({{
+                        client_id: clientId,
+                        redirect_uri: redirectUri,
+                        scope: scope,
+                        approved: true,
+                        code_challenge: codeChallenge || undefined,
+                        code_challenge_method: codeChallengeMethod || undefined
+                    }})
+                }});
+
+                const data = await response.json();
+                if (data.code) {{
+                    window.location.href = `${{redirectUri}}?code=${{data.code}}`;
+                }} else {{
+                    alert('Error: ' + (data.error || 'Unknown error'));
+                }}
+            }} catch (e) {{
+                alert('Request failed: ' + e.message);
+            }}
+        }}
+
+        function deny() {{
+            window.location.href = `${{redirectUri}}?error=access_denied`;
+        }}
+    </script>
+</body>
+</html>
+        "#,
+            params.client_id,  // <title>
+            params.client_id,  // app name in text
+            npub,  // npub-fallback display (hidden by default, shown if profile has name)
+            params.scope.as_deref().unwrap_or("sign_event"),  // scope display
+            params.client_id,  // JS clientId
+            params.redirect_uri,  // JS redirectUri
+            params.scope.as_deref().unwrap_or("sign_event"),  // JS scope
+            params.code_challenge.as_deref().unwrap_or(""),  // JS codeChallenge
+            params.code_challenge_method.as_deref().unwrap_or(""),  // JS codeChallengeMethod
+            pubkey,  // JS userPubkey (hex)
+            relays_json,  // JS userRelays (JSON array)
+        )
+    } else {
+        // User not authenticated - show login/register form
+        format!(r#"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Login - Keycast</title>
+    <style>
+        body {{
+            font-family: -apple-system, sans-serif;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+        }}
+        .container {{
+            background: #2a2a2a;
+            padding: 40px;
+            border-radius: 12px;
+            max-width: 400px;
+            width: 100%;
+        }}
+        h1 {{ color: #bb86fc; margin-bottom: 10px; }}
+        .info {{ color: #888; font-size: 14px; margin-bottom: 20px; }}
+        .app-name {{ color: #03dac6; font-weight: bold; }}
+        .form-group {{
+            margin: 15px 0;
+        }}
+        label {{
+            display: block;
+            margin-bottom: 5px;
+            font-size: 14px;
+        }}
+        input {{
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #444;
+            border-radius: 6px;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            font-size: 14px;
+            box-sizing: border-box;
+        }}
+        input:focus {{
+            outline: none;
+            border-color: #bb86fc;
+        }}
+        button {{
+            width: 100%;
+            padding: 14px;
+            margin: 8px 0;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            background: #03dac6;
+            color: #000;
+        }}
+        button:hover {{
+            background: #04e5d4;
+        }}
+        .form-view {{
+            display: none;
+        }}
+        .form-view.active {{
+            display: block;
+        }}
+        .toggle-link {{
+            text-align: center;
+            margin-top: 20px;
+            font-size: 14px;
+            color: #888;
+        }}
+        .toggle-link a {{
+            color: #bb86fc;
+            text-decoration: none;
+            cursor: pointer;
+        }}
+        .toggle-link a:hover {{
+            text-decoration: underline;
+        }}
+        .error {{
+            background: #cf6679;
+            color: #fff;
+            padding: 10px;
+            border-radius: 6px;
+            margin: 10px 0;
+            display: none;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Login to Keycast</h1>
+        <p class="info"><span class="app-name">{}</span> wants to access your Nostr account</p>
+
+        <div id="error" class="error"></div>
+
+        <div id="login-view" class="form-view">
+            <form onsubmit="handleLogin(event)">
+                <div class="form-group">
+                    <label>Email</label>
+                    <input type="email" id="login-email" required>
+                </div>
+                <div class="form-group">
+                    <label>Password</label>
+                    <input type="password" id="login-password" required>
+                </div>
+                <button type="submit">Login</button>
+            </form>
+            <div class="toggle-link">
+                Don't have an account? <a onclick="showForm('register')">Register</a>
+            </div>
+        </div>
+
+        <div id="register-view" class="form-view">
+            <form onsubmit="handleRegister(event)">
+                <input type="hidden" id="nsec-import">
+                <div id="import-indicator" style="display:none; padding: 10px; background: #2a4a2a; border-radius: 6px; margin-bottom: 15px; color: #03dac6;">
+                    ✓ Key imported from app (BYOK)
+                </div>
+                <div class="form-group">
+                    <label>Email</label>
+                    <input type="email" id="register-email" required>
+                </div>
+                <div class="form-group">
+                    <label>Password</label>
+                    <input type="password" id="register-password" required minlength="8">
+                </div>
+                <div class="form-group">
+                    <label>Confirm Password</label>
+                    <input type="password" id="register-password-confirm" required minlength="8">
+                </div>
+                <button type="submit">Register</button>
+            </form>
+            <div class="toggle-link">
+                Already have an account? <a onclick="showForm('login')">Login</a>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const clientId = '{}';
+        const redirectUri = '{}';
+        const scope = '{}';
+        const codeChallenge = '{}';
+        const codeChallengeMethod = '{}';
+        const importKey = new URLSearchParams(window.location.search).get('import_key') === 'true';
+
+        // Handle nsec import via postMessage (for apps that auto-generate keys)
+        if (importKey && window.opener) {{
+            const allowedOrigin = new URL(redirectUri).origin;
+
+            // Signal parent we're ready to receive nsec
+            window.opener.postMessage(
+                {{ type: 'keycast_ready' }},
+                allowedOrigin
+            );
+
+            // Listen for nsec from parent app
+            window.addEventListener('message', (event) => {{
+                if (event.origin !== allowedOrigin) {{
+                    console.warn('[Keycast] Rejected nsec from unauthorized origin:', event.origin);
+                    return;
+                }}
+                if (event.data.type === 'import_nsec' && event.data.nsec) {{
+                    const nsec = event.data.nsec;
+                    document.getElementById('nsec-import').value = nsec;
+
+                    // Show user-friendly indicator
+                    const indicator = document.getElementById('import-indicator');
+                    if (indicator) {{
+                        // Simple, non-technical message showing which app provided the key
+                        indicator.innerHTML = '✓ Continuing with your ' + clientId + ' account';
+                        indicator.style.display = 'block';
+                    }}
+                    console.log('[Keycast] Key imported from', clientId);
+                }}
+            }});
+        }}
+
+        function showForm(form) {{
+            document.querySelectorAll('.form-view').forEach(v => v.classList.remove('active'));
+
+            if (form === 'login') {{
+                document.getElementById('login-view').classList.add('active');
+            }} else {{
+                document.getElementById('register-view').classList.add('active');
+            }}
+
+            hideError();
+        }}
+
+        // Initialize form based on import_key parameter
+        if (importKey) {{
+            showForm('register');
+        }} else {{
+            showForm('login');
+        }}
+
+        function showError(message) {{
+            const errorEl = document.getElementById('error');
+            errorEl.textContent = message;
+            errorEl.style.display = 'block';
+        }}
+
+        function hideError() {{
+            document.getElementById('error').style.display = 'none';
+        }}
+
+        async function handleLogin(e) {{
+            e.preventDefault();
+            hideError();
+
+            const email = document.getElementById('login-email').value;
+            const password = document.getElementById('login-password').value;
+
+            try {{
+                const response = await fetch('/api/oauth/login', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    credentials: 'include',
+                    body: JSON.stringify({{
+                        email,
+                        password,
+                        client_id: clientId,
+                        redirect_uri: redirectUri,
+                        scope: scope,
+                        code_challenge: codeChallenge || undefined,
+                        code_challenge_method: codeChallengeMethod || undefined
+                    }})
+                }});
+
+                if (!response.ok) {{
+                    const data = await response.json().catch(() => ({{}}));
+                    showError(data.error || 'Login failed');
+                    return;
+                }}
+
+                // Cookie is set, reload to show approval screen
+                window.location.reload();
+            }} catch (e) {{
+                showError('Request failed: ' + e.message);
+            }}
+        }}
+
+        async function handleRegister(e) {{
+            e.preventDefault();
+            hideError();
+
+            const email = document.getElementById('register-email').value;
+            const password = document.getElementById('register-password').value;
+            const passwordConfirm = document.getElementById('register-password-confirm').value;
+            const nsec = document.getElementById('nsec-import').value || undefined;
+
+            if (password !== passwordConfirm) {{
+                showError('Passwords do not match');
+                return;
+            }}
+
+            try {{
+                const response = await fetch('/api/oauth/register', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    credentials: 'include',
+                    body: JSON.stringify({{
+                        email,
+                        password,
+                        nsec,  // Include imported nsec if provided via postMessage
+                        client_id: clientId,
+                        redirect_uri: redirectUri,
+                        scope: scope,
+                        code_challenge: codeChallenge || undefined,
+                        code_challenge_method: codeChallengeMethod || undefined
+                    }})
+                }});
+
+                if (!response.ok) {{
+                    const data = await response.json().catch(() => ({{}}));
+                    showError(data.error || 'Registration failed');
+                    return;
+                }}
+
+                // Cookie is set, reload to show approval screen
+                window.location.reload();
+            }} catch (e) {{
+                showError('Request failed: ' + e.message);
+            }}
+        }}
+    </script>
+</body>
+</html>
+        "#,
+            params.client_id,
+            params.client_id,
+            params.redirect_uri,
+            params.scope.as_deref().unwrap_or("sign_event"),
+            params.code_challenge.as_deref().unwrap_or(""),
+            params.code_challenge_method.as_deref().unwrap_or(""),
+        )
+    };
+
+    // If we detected a stale cookie, clear it
+    if clear_cookie {
+        let clear_cookie_header = "keycast_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0";
+        Ok((
+            [(axum::http::header::SET_COOKIE, clear_cookie_header)],
+            Html(html)
+        ).into_response())
+    } else {
+        Ok(Html(html).into_response())
+    }
 }
 
 /// POST /oauth/authorize
@@ -114,9 +1002,12 @@ pub async fn authorize_post(
 
     let tenant_id = tenant.0.id;
 
-    // Extract user public key from JWT token in Authorization header
-    let user_public_key = super::auth::extract_user_from_token(&headers)
-        .map_err(|_| OAuthError::Unauthorized)?;
+    // Extract user public key from UCAN cookie
+    let user_public_key = super::auth::extract_ucan_from_cookie(&headers).and_then(|token| {
+        // Parse UCAN from string using ucan_auth helper
+        crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id).ok().map(|(pubkey, _)| pubkey)
+    })
+        .ok_or(OAuthError::Unauthorized)?;
 
     // Generate authorization code
     let code: String = rand::thread_rng()
@@ -129,7 +1020,7 @@ pub async fn authorize_post(
     let expires_at = Utc::now() + Duration::minutes(10);
 
     // Get or create application
-    let app_id: Option<i64> =
+    let app_id: Option<i32> =
         sqlx::query_scalar("SELECT id FROM oauth_applications WHERE tenant_id = $1 AND client_id = $2")
             .bind(tenant_id)
             .bind(&req.client_id)
@@ -155,10 +1046,10 @@ pub async fn authorize_post(
         .await?
     };
 
-    // Store authorization code
+    // Store authorization code with PKCE support
     sqlx::query(
-        "INSERT INTO oauth_codes (tenant_id, code, user_public_key, application_id, redirect_uri, scope, expires_at, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        "INSERT INTO oauth_codes (tenant_id, code, user_public_key, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
     )
     .bind(tenant_id)
     .bind(&code)
@@ -166,6 +1057,8 @@ pub async fn authorize_post(
     .bind(app_id)
     .bind(&req.redirect_uri)
     .bind(&req.scope)
+    .bind(&req.code_challenge)
+    .bind(&req.code_challenge_method)
     .bind(expires_at)
     .bind(Utc::now())
     .execute(&auth_state.state.db)
@@ -181,18 +1074,40 @@ pub async fn authorize_post(
 }
 
 /// POST /oauth/token
-/// Exchange authorization code for bunker URL
+/// Exchange authorization code for bunker URL (authorization_code grant ONLY)
+/// This is the standard OAuth 2.0 token endpoint for third-party apps
 pub async fn token(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
     Json(req): Json<TokenRequest>,
 ) -> Result<Json<TokenResponse>, OAuthError> {
     let tenant_id = tenant.0.id;
+
+    // Only accept authorization_code grant (ROPC removed)
+    let grant_type = req.grant_type.as_deref().unwrap_or("authorization_code");
+
+    if grant_type != "authorization_code" {
+        return Err(OAuthError::InvalidRequest(
+            format!("Invalid grant_type '{}'. This endpoint only accepts 'authorization_code'.", grant_type)
+        ));
+    }
+
+    handle_authorization_code_grant(tenant_id, auth_state, req).await
+}
+
+/// Handle authorization code grant (standard OAuth flow)
+async fn handle_authorization_code_grant(
+    tenant_id: i64,
+    auth_state: super::routes::AuthState,
+    req: TokenRequest,
+) -> Result<Json<TokenResponse>, OAuthError> {
     let pool = &auth_state.state.db;
 
-    // Fetch and validate authorization code
-    let auth_code: Option<(String, i64, String, String)> = sqlx::query_as(
-        "SELECT user_public_key, application_id, redirect_uri, scope FROM oauth_codes
+    // Fetch and validate authorization code with PKCE fields
+    type AuthCodeRow = (String, i32, String, String, Option<String>, Option<String>);
+    let auth_code: Option<AuthCodeRow> = sqlx::query_as(
+        "SELECT user_public_key, application_id, redirect_uri, scope, code_challenge, code_challenge_method
+         FROM oauth_codes
          WHERE tenant_id = $1 AND code = $2 AND expires_at > $3"
     )
     .bind(tenant_id)
@@ -201,14 +1116,23 @@ pub async fn token(
     .fetch_optional(pool)
     .await?;
 
-    let (user_public_key, application_id, stored_redirect_uri, _scope) =
+    let (user_public_key, application_id, stored_redirect_uri, scope, code_challenge, code_challenge_method) =
         auth_code.ok_or(OAuthError::Unauthorized)?;
 
     // Validate redirect_uri matches
     if stored_redirect_uri != req.redirect_uri {
-        return Err(OAuthError::InvalidRequest(
-            "redirect_uri mismatch".to_string(),
-        ));
+        return Err(OAuthError::InvalidRequest("redirect_uri mismatch".to_string()));
+    }
+
+    // PKCE validation (if code_challenge was provided during authorization)
+    if let Some(challenge) = code_challenge {
+        let method = code_challenge_method.as_deref().unwrap_or("plain");
+        let verifier = req.code_verifier.as_ref().ok_or_else(|| {
+            OAuthError::InvalidRequest("code_verifier required for PKCE flow".to_string())
+        })?;
+
+        validate_pkce(verifier, &challenge, method)?;
+        tracing::debug!("PKCE validation successful for code: {}", &req.code[..8]);
     }
 
     // Delete the authorization code (one-time use)
@@ -218,25 +1142,60 @@ pub async fn token(
         .execute(pool)
         .await?;
 
-    // Look up user's personal Nostr key from personal_keys table
-    // We get the encrypted key to use as the bunker secret (for NIP-46 decryption + signing)
-    let encrypted_user_key: Vec<u8> = sqlx::query_scalar(
-        "SELECT encrypted_secret_key FROM personal_keys WHERE tenant_id = $1 AND user_public_key = $2"
+    // Get user's email for UCAN
+    let email: String = sqlx::query_scalar(
+        "SELECT email FROM users WHERE public_key = $1 AND tenant_id = $2"
     )
-    .bind(tenant_id)
     .bind(&user_public_key)
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await?;
+
+    // Create OAuth authorization and generate token response
+    create_oauth_authorization_and_token(
+        tenant_id,
+        &user_public_key,
+        &email,
+        application_id,
+        &scope,
+        auth_state,
+    ).await
+}
+
+// handle_password_grant() removed - ROPC grant type deprecated and removed
+
+/// Common function to create OAuth authorization and generate TokenResponse
+async fn create_oauth_authorization_and_token(
+    tenant_id: i64,
+    user_public_key: &str,
+    _email: &str,
+    application_id: i32,
+    scope: &str,
+    auth_state: super::routes::AuthState,
+) -> Result<Json<TokenResponse>, OAuthError> {
+    let pool = &auth_state.state.db;
+    let _key_manager = auth_state.state.key_manager.as_ref();
+
+    // Look up user's personal Nostr key from personal_keys table
+    let encrypted_user_key: Vec<u8> = sqlx::query_scalar(
+        "SELECT encrypted_secret_key FROM personal_keys WHERE user_public_key = $1"
+    )
+    .bind(user_public_key)
     .fetch_one(pool)
     .await
     .map_err(OAuthError::Database)?;
 
+    // OAuth apps don't get UCAN tokens (no admin API access needed)
+    // They only need bunker URL for NIP-46 remote signing
+
     // Parse the user's public key to use as bunker public key
-    let bunker_public_key = nostr_sdk::PublicKey::from_hex(&user_public_key)
+    let bunker_public_key = nostr_sdk::PublicKey::from_hex(user_public_key)
         .map_err(|e| OAuthError::InvalidRequest(format!("Invalid public key: {}", e)))?;
 
     // Generate connection secret for NIP-46 authentication
     let connection_secret: String = rand::thread_rng()
         .sample_iter(&rand::distributions::Alphanumeric)
-        .take(32)
+        .take(48)
         .map(char::from)
         .collect();
 
@@ -245,40 +1204,303 @@ pub async fn token(
     let relays_json = serde_json::to_string(&vec![relay_url])
         .map_err(|e| OAuthError::InvalidRequest(format!("Failed to serialize relays: {}", e)))?;
 
+    // Get default policy if not specified by application
+    let policy_id: Option<i32> = sqlx::query_scalar(
+        "SELECT policy_id FROM oauth_applications WHERE id = $1"
+    )
+    .bind(application_id)
+    .fetch_one(pool)
+    .await?;
+
+    let policy_id = if let Some(pid) = policy_id {
+        pid
+    } else {
+        sqlx::query_scalar::<_, i32>(
+            "SELECT id FROM policies WHERE name = 'Standard Social (Default)' AND tenant_id = $1 LIMIT 1"
+        )
+        .bind(tenant_id)
+        .fetch_one(pool)
+        .await?
+    };
+
+    // Use ON CONFLICT to avoid duplicates per user/app combination
     sqlx::query(
-        "INSERT INTO oauth_authorizations (tenant_id, user_public_key, application_id, bunker_public_key, bunker_secret, secret, relays, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+        "INSERT INTO oauth_authorizations (tenant_id, user_public_key, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (user_public_key, application_id)
+         DO UPDATE SET secret = $6, relays = $7, policy_id = $8, updated_at = $10"
     )
     .bind(tenant_id)
-    .bind(&user_public_key)
+    .bind(user_public_key)
     .bind(application_id)
     .bind(bunker_public_key.to_hex())
     .bind(&encrypted_user_key)      // bunker_secret = encrypted user key (BLOB)
     .bind(&connection_secret)        // secret = connection secret (TEXT)
     .bind(&relays_json)
+    .bind(policy_id)
     .bind(Utc::now())
     .bind(Utc::now())
     .execute(pool)
     .await?;
 
-    // Signal signer daemon to reload immediately
-    let signal_file = std::path::Path::new("database/.reload_signal");
-    if let Err(e) = std::fs::File::create(signal_file) {
-        tracing::error!("Failed to create reload signal file: {}", e);
-    } else {
-        tracing::info!("Created reload signal for signer daemon");
+    // Signal signer daemon to reload via channel (instant notification)
+    if let Some(tx) = &auth_state.auth_tx {
+        use keycast_core::authorization_channel::AuthorizationCommand;
+        if let Err(e) = tx.send(AuthorizationCommand::Upsert {
+            bunker_pubkey: bunker_public_key.to_hex(),
+            tenant_id,
+            is_oauth: true,
+        }).await {
+            tracing::error!("Failed to send authorization upsert command: {}", e);
+        } else {
+            tracing::info!("Sent authorization upsert command to signer daemon");
+        }
     }
 
-    // Build bunker URL
+    // Build bunker URL with deployment-wide relay list
+    let relays = keycast_core::types::authorization::Authorization::get_bunker_relays();
+    let relay_params: String = relays
+        .iter()
+        .map(|r| format!("relay={}", urlencoding::encode(r)))
+        .collect::<Vec<_>>()
+        .join("&");
+
     let bunker_url = format!(
-        "bunker://{}?relay={}&secret={}",
+        "bunker://{}?{}&secret={}",
         bunker_public_key.to_hex(),
-        relay_url,
+        relay_params,
         connection_secret
     );
 
-    Ok(Json(TokenResponse { bunker_url }))
+    Ok(Json(TokenResponse {
+        bunker_url,
+        token_type: "Bearer".to_string(),
+        expires_in: 0,  // Bunker URLs don't expire
+        scope: Some(scope.to_string()),
+    }))
 }
+
+// ============================================================================
+// OAuth Popup Login/Register Handlers (return approval HTML directly)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct OAuthLoginRequest {
+    pub email: String,
+    pub password: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub scope: Option<String>,
+    pub code_challenge: Option<String>,
+    pub code_challenge_method: Option<String>,
+}
+
+/// POST /oauth/login
+/// Login endpoint for OAuth popup - sets UCAN cookie and returns success
+/// Page will reload to show approval screen
+pub async fn oauth_login(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    Json(req): Json<OAuthLoginRequest>,
+) -> Result<impl IntoResponse, OAuthError> {
+    use super::auth::generate_ucan_token;
+    let pool = &auth_state.state.db;
+    let key_manager = auth_state.state.key_manager.as_ref();
+    let tenant_id = tenant.0.id;
+
+    tracing::info!("OAuth popup login for email: {} in tenant: {}", req.email, tenant_id);
+
+    // Validate credentials
+    let user: Option<(String, String)> = sqlx::query_as(
+        "SELECT public_key, password_hash FROM users WHERE email = $1 AND tenant_id = $2 AND password_hash IS NOT NULL"
+    )
+    .bind(&req.email)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let (public_key, password_hash) = user.ok_or(OAuthError::Unauthorized)?;
+
+    let valid = verify(&req.password, &password_hash)
+        .map_err(|_| OAuthError::InvalidRequest("Password verification failed".to_string()))?;
+
+    if !valid {
+        return Err(OAuthError::Unauthorized);
+    }
+
+    // Get user's keys for UCAN generation
+    let encrypted_secret: Vec<u8> = sqlx::query_scalar(
+        "SELECT encrypted_secret_key FROM personal_keys WHERE user_public_key = $1"
+    )
+    .bind(&public_key)
+    .fetch_one(pool)
+    .await
+    .map_err(OAuthError::Database)?;
+
+    let decrypted_secret = key_manager
+        .decrypt(&encrypted_secret)
+        .await
+        .map_err(|e| OAuthError::Encryption(e.to_string()))?;
+
+    let secret_hex = String::from_utf8(decrypted_secret)
+        .map_err(|_| OAuthError::InvalidRequest("Invalid UTF-8 in secret key".to_string()))?;
+
+    let keys = Keys::parse(&secret_hex)
+        .map_err(|_| OAuthError::InvalidRequest("Invalid secret key".to_string()))?;
+
+    // Generate UCAN token (OAuth popup doesn't set relays, uses defaults)
+    let ucan_token = generate_ucan_token(&keys, tenant_id, &req.email, None).await
+        .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
+
+    // OAuth popup login: bunker authorization will be created manually by user if needed
+
+    tracing::info!("OAuth popup login successful for user: {}", public_key);
+
+    // Set cookie and return success - page will reload to show approval
+    let cookie = format!(
+        "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400",
+        ucan_token
+    );
+
+    Ok((
+        [(axum::http::header::SET_COOKIE, cookie)],
+        Json(serde_json::json!({
+            "success": true,
+            "pubkey": public_key
+        }))
+    ).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OAuthRegisterRequest {
+    pub email: String,
+    pub password: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub scope: Option<String>,
+    pub code_challenge: Option<String>,
+    pub code_challenge_method: Option<String>,
+    pub nsec: Option<String>,  // Optional: BYOK
+    pub relays: Option<Vec<String>>,  // Optional: preferred relays
+}
+
+/// POST /oauth/register
+/// Registration endpoint for OAuth popup - sets UCAN cookie and returns success
+/// Page will reload to show approval screen
+pub async fn oauth_register(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    Json(req): Json<OAuthRegisterRequest>,
+) -> Result<impl IntoResponse, OAuthError> {
+    use super::auth::{generate_ucan_token, RegisterRequest};
+    let pool = &auth_state.state.db;
+    let key_manager = auth_state.state.key_manager.as_ref();
+    let tenant_id = tenant.0.id;
+
+    tracing::info!("OAuth popup registration for email: {} in tenant: {}", req.email, tenant_id);
+
+    // Use the existing registration logic from auth module
+    let register_req = RegisterRequest {
+        email: req.email.clone(),
+        password: req.password.clone(),
+        nsec: req.nsec.clone(),
+        relays: req.relays.clone(),
+    };
+
+    // Check if email already exists
+    let existing: Option<(String,)> = sqlx::query_as("SELECT public_key FROM users WHERE email = $1 AND tenant_id = $2")
+        .bind(&register_req.email)
+        .bind(tenant_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(OAuthError::Database)?;
+
+    if existing.is_some() {
+        return Err(OAuthError::InvalidRequest("Email already registered".to_string()));
+    }
+
+    // Hash password
+    let password_hash = bcrypt::hash(&register_req.password, bcrypt::DEFAULT_COST)
+        .map_err(|_| OAuthError::InvalidRequest("Password hashing failed".to_string()))?;
+
+    // Generate keys (or use provided)
+    let keys = if let Some(ref nsec_str) = register_req.nsec {
+        Keys::parse(nsec_str)
+            .map_err(|e| OAuthError::InvalidRequest(format!("Invalid nsec: {}", e)))?
+    } else {
+        Keys::generate()
+    };
+
+    let public_key = keys.public_key();
+    let secret_key = keys.secret_key();
+
+    // Encrypt secret key (as hex string for UTF-8 compatibility)
+    let secret_hex = secret_key.to_secret_hex();
+    let encrypted_secret = key_manager
+        .encrypt(secret_hex.as_bytes())
+        .await
+        .map_err(|e| OAuthError::Encryption(e.to_string()))?;
+
+    // Start transaction
+    let mut tx = pool.begin().await.map_err(OAuthError::Database)?;
+
+    // Insert user
+    sqlx::query(
+        "INSERT INTO users (public_key, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)"
+    )
+    .bind(public_key.to_hex())
+    .bind(tenant_id)
+    .bind(&register_req.email)
+    .bind(&password_hash)
+    .bind(false)
+    .bind(Utc::now())
+    .bind(Utc::now())
+    .execute(&mut *tx)
+    .await
+    .map_err(OAuthError::Database)?;
+
+    // Insert personal key
+    sqlx::query(
+        "INSERT INTO personal_keys (user_public_key, encrypted_secret_key, created_at, updated_at)
+         VALUES ($1, $2, $3, $4)"
+    )
+    .bind(public_key.to_hex())
+    .bind(&encrypted_secret)
+    .bind(Utc::now())
+    .bind(Utc::now())
+    .execute(&mut *tx)
+    .await
+    .map_err(OAuthError::Database)?;
+
+    tx.commit().await.map_err(OAuthError::Database)?;
+
+    // Generate UCAN token with optional relays from request
+    let relays_slice = req.relays.as_deref();
+    let ucan_token = generate_ucan_token(&keys, tenant_id, &register_req.email, relays_slice).await
+        .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
+
+    // OAuth popup register: bunker authorization will be created manually by user if needed
+
+    tracing::info!("OAuth popup registration successful for user: {}", public_key.to_hex());
+
+    // Set cookie and return success - page will reload to show approval
+    let cookie = format!(
+        "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400",
+        ucan_token
+    );
+
+    Ok((
+        [(axum::http::header::SET_COOKIE, cookie)],
+        Json(serde_json::json!({
+            "success": true,
+            "pubkey": public_key.to_hex()
+        }))
+    ).into_response())
+}
+
+// generate_auto_approve_html_with_cookie() and generate_approval_page_html() removed
+// Now using reload pattern - /oauth/authorize GET renders these directly
 
 // ============================================================================
 // nostr-login Integration Handlers
@@ -390,7 +1612,7 @@ pub async fn connect_get(
         params.relay
     );
 
-    // TODO: Check if user is logged in via session/JWT
+    // TODO: Check if user is logged in via session/UCAN
     // For now, show a simple auth form
 
     let app_name = params.name.as_deref().unwrap_or("Unknown App");
@@ -584,7 +1806,7 @@ pub async fn connect_post(
     // Create or get application - use client pubkey as identifier
     let app_name = format!("nostr-login-{}", &form.client_pubkey[..12]);
 
-    let app_id: i64 = match sqlx::query_scalar::<_, i64>(
+    let app_id: i32 = match sqlx::query_scalar::<_, i32>(
         "SELECT id FROM oauth_applications WHERE tenant_id = ?1 AND client_id = ?2"
     )
     .bind(tenant_id)
@@ -630,12 +1852,18 @@ pub async fn connect_post(
     .execute(&auth_state.state.db)
     .await?;
 
-    // Signal signer daemon to reload
-    let signal_file = std::path::Path::new("database/.reload_signal");
-    if let Err(e) = std::fs::File::create(signal_file) {
-        tracing::error!("Failed to create reload signal file: {}", e);
-    } else {
-        tracing::info!("Created reload signal for signer daemon (nostr-login)");
+    // Signal signer daemon to reload via channel (instant notification)
+    if let Some(tx) = &auth_state.auth_tx {
+        use keycast_core::authorization_channel::AuthorizationCommand;
+        if let Err(e) = tx.send(AuthorizationCommand::Upsert {
+            bunker_pubkey: bunker_public_key.to_hex(),
+            tenant_id,
+            is_oauth: true,
+        }).await {
+            tracing::error!("Failed to send authorization upsert command (nostr-login): {}", e);
+        } else {
+            tracing::info!("Sent authorization upsert command to signer daemon (nostr-login)");
+        }
     }
 
     Ok(Html(r#"

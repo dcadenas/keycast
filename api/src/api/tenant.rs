@@ -31,8 +31,8 @@ pub struct Tenant {
     pub domain: String,
     pub name: String,
     pub settings: Option<String>, // JSON
-    pub created_at: String,
-    pub updated_at: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Tenant settings parsed from JSON
@@ -207,6 +207,45 @@ pub async fn list_tenants(pool: &PgPool) -> Result<Vec<Tenant>, sqlx::Error> {
     .await
 }
 
+/// Create default policies for a new tenant
+/// Mirrors the policy structure from migration 0011
+async fn create_default_policies(pool: &PgPool, tenant_id: i64) -> Result<(), sqlx::Error> {
+    // Create the three default policies
+    sqlx::query(
+        "INSERT INTO policies (tenant_id, name, created_at, updated_at)
+         VALUES
+            ($1, 'Standard Social (Default)', NOW(), NOW()),
+            ($1, 'Read Only', NOW(), NOW()),
+            ($1, 'Wallet Only', NOW(), NOW())"
+    )
+    .bind(tenant_id)
+    .execute(pool)
+    .await?;
+
+    // Get the policy IDs we just created
+    let standard_social_id: i32 = sqlx::query_scalar(
+        "SELECT id FROM policies WHERE tenant_id = $1 AND name = 'Standard Social (Default)'"
+    )
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await?;
+
+    // Link permissions to "Standard Social" policy
+    // These permission IDs are global (no tenant_id) from migration 0011
+    // Social events (1), Messaging (2), Lists (4)
+    sqlx::query(
+        "INSERT INTO policy_permissions (policy_id, permission_id)
+         SELECT $1, id FROM permissions
+         WHERE identifier IN ('allowed_kinds_social', 'allowed_kinds_messaging', 'allowed_kinds_lists')"
+    )
+    .bind(standard_social_id)
+    .execute(pool)
+    .await?;
+
+    tracing::info!("Created default policies for tenant {}", tenant_id);
+    Ok(())
+}
+
 /// Validate domain format to prevent abuse
 fn validate_domain(domain: &str) -> Result<(), TenantError> {
     // Basic validation rules
@@ -333,14 +372,18 @@ pub async fn get_or_create_tenant(
             )
             .await?;
 
-            // 4. Log provisioning event for monitoring
+            // 4. Create default policies for new tenant
+            create_default_policies(pool, tenant.id).await
+                .map_err(TenantError::DatabaseError)?;
+
+            // 5. Log provisioning event for monitoring
             tracing::info!(
                 target: "tenant_auto_provision",
                 domain = %domain,
                 tenant_id = tenant.id,
                 tenant_name = %name,
                 settings = %default_settings,
-                "Auto-provisioned new tenant"
+                "Auto-provisioned new tenant with default policies"
             );
 
             Ok(tenant)
@@ -355,13 +398,14 @@ mod tests {
 
     #[test]
     fn test_tenant_settings_parsing() {
+        use chrono::Utc;
         let tenant = Tenant {
             id: 1,
             domain: "test.com".to_string(),
             name: "Test".to_string(),
             settings: Some(r#"{"relay":"wss://test.relay","email_from":"noreply@test.com"}"#.to_string()),
-            created_at: "2025-01-01".to_string(),
-            updated_at: "2025-01-01".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         };
 
         let settings = tenant.get_settings().unwrap();
@@ -371,13 +415,14 @@ mod tests {
 
     #[test]
     fn test_tenant_relay_url_fallback() {
+        use chrono::Utc;
         let tenant = Tenant {
             id: 1,
             domain: "test.com".to_string(),
             name: "Test".to_string(),
             settings: None,
-            created_at: "2025-01-01".to_string(),
-            updated_at: "2025-01-01".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         };
 
         assert_eq!(tenant.relay_url(), "wss://relay.damus.io");
@@ -385,13 +430,14 @@ mod tests {
 
     #[test]
     fn test_tenant_email_from_fallback() {
+        use chrono::Utc;
         let tenant = Tenant {
             id: 1,
             domain: "test.com".to_string(),
             name: "Test".to_string(),
             settings: None,
-            created_at: "2025-01-01".to_string(),
-            updated_at: "2025-01-01".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         };
 
         assert_eq!(tenant.email_from(), "noreply@test.com");
