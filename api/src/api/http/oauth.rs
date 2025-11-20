@@ -10,12 +10,35 @@ use axum::{
 use base64::Engine;
 use bcrypt::verify;
 use chrono::{Duration, Utc};
+use dashmap::DashMap;
 use nostr_sdk::{Keys, ToBech32};
+use once_cell::sync::Lazy;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::time::{Duration as StdDuration, Instant};
 
 // Import constants and helpers from auth module
 use super::auth::TOKEN_EXPIRY_HOURS;
+
+/// Polling cache for iOS PWA OAuth flow
+/// Maps state token → (authorization code, expiry time)
+/// TTL: 5 minutes for security
+static POLLING_CACHE: Lazy<DashMap<String, (String, Instant)>> = Lazy::new(DashMap::new);
+
+const POLLING_TTL: StdDuration = StdDuration::from_secs(300); // 5 minutes
+
+/// Extract optional nsec from PKCE code_verifier
+/// Format: "{random}.{nsec}" where nsec is either nsec1... (bech32) or 64-char hex
+/// Returns None if no nsec embedded (standard PKCE flow)
+pub fn extract_nsec_from_verifier_public(verifier: &str) -> Option<String> {
+    if let Some((_random, nsec)) = verifier.split_once('.') {
+        // Check if it looks like an nsec (starts with nsec1) or hex (64 chars)
+        if nsec.starts_with("nsec1") || (nsec.len() == 64 && nsec.chars().all(|c| c.is_ascii_hexdigit())) {
+            return Some(nsec.to_string());
+        }
+    }
+    None
+}
 
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeRequest {
@@ -787,10 +810,6 @@ window.close();
 
         <div id="register-view" class="form-view">
             <form onsubmit="handleRegister(event)">
-                <input type="hidden" id="nsec-import">
-                <div id="import-indicator" style="display:none; padding: 10px; background: #2a4a2a; border-radius: 6px; margin-bottom: 15px; color: #03dac6;">
-                    ✓ Key imported from app (BYOK)
-                </div>
                 <div class="form-group">
                     <label>Email</label>
                     <input type="email" id="register-email" required>
@@ -817,39 +836,8 @@ window.close();
         const scope = '{}';
         const codeChallenge = '{}';
         const codeChallengeMethod = '{}';
-        const importKey = new URLSearchParams(window.location.search).get('import_key') === 'true';
-
-        // Handle nsec import via postMessage (for apps that auto-generate keys)
-        if (importKey && window.opener) {{
-            const allowedOrigin = new URL(redirectUri).origin;
-
-            // Signal parent we're ready to receive nsec
-            window.opener.postMessage(
-                {{ type: 'keycast_ready' }},
-                allowedOrigin
-            );
-
-            // Listen for nsec from parent app
-            window.addEventListener('message', (event) => {{
-                if (event.origin !== allowedOrigin) {{
-                    console.warn('[Keycast] Rejected nsec from unauthorized origin:', event.origin);
-                    return;
-                }}
-                if (event.data.type === 'import_nsec' && event.data.nsec) {{
-                    const nsec = event.data.nsec;
-                    document.getElementById('nsec-import').value = nsec;
-
-                    // Show user-friendly indicator
-                    const indicator = document.getElementById('import-indicator');
-                    if (indicator) {{
-                        // Simple, non-technical message showing which app provided the key
-                        indicator.innerHTML = '✓ Continuing with your ' + clientId + ' account';
-                        indicator.style.display = 'block';
-                    }}
-                    console.log('[Keycast] Key imported from', clientId);
-                }}
-            }});
-        }}
+        const defaultRegister = new URLSearchParams(window.location.search).get('default_register') === 'true';
+        const byokPubkey = new URLSearchParams(window.location.search).get('byok_pubkey');
 
         function showForm(form) {{
             document.querySelectorAll('.form-view').forEach(v => v.classList.remove('active'));
@@ -863,8 +851,8 @@ window.close();
             hideError();
         }}
 
-        // Initialize form based on import_key parameter
-        if (importKey) {{
+        // Initialize form based on default_register parameter
+        if (defaultRegister) {{
             showForm('register');
         }} else {{
             showForm('login');
@@ -923,7 +911,6 @@ window.close();
             const email = document.getElementById('register-email').value;
             const password = document.getElementById('register-password').value;
             const passwordConfirm = document.getElementById('register-password-confirm').value;
-            const nsec = document.getElementById('nsec-import').value || undefined;
 
             if (password !== passwordConfirm) {{
                 showError('Passwords do not match');
@@ -938,7 +925,7 @@ window.close();
                     body: JSON.stringify({{
                         email,
                         password,
-                        nsec,  // Include imported nsec if provided via postMessage
+                        pubkey: byokPubkey || undefined,  // Include pubkey for BYOK flow
                         client_id: clientId,
                         redirect_uri: redirectUri,
                         scope: scope,
@@ -947,14 +934,20 @@ window.close();
                     }})
                 }});
 
+                const data = await response.json().catch(() => ({{}}));
+
                 if (!response.ok) {{
-                    const data = await response.json().catch(() => ({{}}));
                     showError(data.error || 'Registration failed');
                     return;
                 }}
 
-                // Cookie is set, reload to show approval screen
-                window.location.reload();
+                // Auto-approve: registration returns code, redirect to redirect_uri
+                if (data.code) {{
+                    const redirectUrl = `${{redirectUri}}?code=${{data.code}}`;
+                    window.location.href = redirectUrl;
+                }} else {{
+                    showError('Registration succeeded but no authorization code received');
+                }}
             }} catch (e) {{
                 showError('Request failed: ' + e.message);
             }}
@@ -1080,7 +1073,7 @@ pub async fn token(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
     Json(req): Json<TokenRequest>,
-) -> Result<Json<TokenResponse>, OAuthError> {
+) -> Result<Response, OAuthError> {
     let tenant_id = tenant.0.id;
 
     // Only accept authorization_code grant (ROPC removed)
@@ -1100,7 +1093,7 @@ async fn handle_authorization_code_grant(
     tenant_id: i64,
     auth_state: super::routes::AuthState,
     req: TokenRequest,
-) -> Result<Json<TokenResponse>, OAuthError> {
+) -> Result<Response, OAuthError> {
     let pool = &auth_state.state.db;
 
     // Fetch and validate authorization code with PKCE fields
@@ -1151,6 +1144,10 @@ async fn handle_authorization_code_grant(
     .fetch_one(pool)
     .await?;
 
+    // Extract optional nsec from code_verifier
+    let nsec_from_verifier = req.code_verifier.as_ref()
+        .and_then(|v| extract_nsec_from_verifier_public(v));
+
     // Create OAuth authorization and generate token response
     create_oauth_authorization_and_token(
         tenant_id,
@@ -1158,6 +1155,7 @@ async fn handle_authorization_code_grant(
         &email,
         application_id,
         &scope,
+        nsec_from_verifier,
         auth_state,
     ).await
 }
@@ -1165,25 +1163,83 @@ async fn handle_authorization_code_grant(
 // handle_password_grant() removed - ROPC grant type deprecated and removed
 
 /// Common function to create OAuth authorization and generate TokenResponse
+/// Creates personal_keys if missing (first token exchange with optional nsec from code_verifier)
 async fn create_oauth_authorization_and_token(
     tenant_id: i64,
     user_public_key: &str,
     _email: &str,
     application_id: i32,
     scope: &str,
+    nsec_from_verifier: Option<String>,
     auth_state: super::routes::AuthState,
-) -> Result<Json<TokenResponse>, OAuthError> {
+) -> Result<Response, OAuthError> {
     let pool = &auth_state.state.db;
-    let _key_manager = auth_state.state.key_manager.as_ref();
+    let key_manager = auth_state.state.key_manager.as_ref();
 
-    // Look up user's personal Nostr key from personal_keys table
-    let encrypted_user_key: Vec<u8> = sqlx::query_scalar(
+    // Check if personal_keys exist
+    let encrypted_user_key: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT encrypted_secret_key FROM personal_keys WHERE user_public_key = $1"
     )
     .bind(user_public_key)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .map_err(OAuthError::Database)?;
+
+    let (encrypted_user_key, _keys_just_created) = if let Some(existing_key) = encrypted_user_key {
+        // Keys already exist
+        if nsec_from_verifier.is_some() {
+            tracing::warn!("User {} already has personal_keys, ignoring nsec from code_verifier", user_public_key);
+        }
+        (existing_key, false)
+    } else {
+        // Create personal_keys from code_verifier nsec or auto-generate
+        tracing::info!("Creating personal_keys for user {} during token exchange", user_public_key);
+
+        let keys = if let Some(nsec_str) = nsec_from_verifier {
+            tracing::info!("Using nsec from code_verifier (BYOK)");
+            let keys = Keys::parse(&nsec_str)
+                .map_err(|e| OAuthError::InvalidRequest(format!("Invalid nsec in code_verifier: {}", e)))?;
+
+            // Verify nsec matches user's registered pubkey
+            if keys.public_key().to_hex() != user_public_key {
+                return Err(OAuthError::InvalidRequest(format!(
+                    "nsec in code_verifier doesn't match registered pubkey. Expected: {}, got: {}",
+                    user_public_key,
+                    keys.public_key().to_hex()
+                )));
+            }
+
+            keys
+        } else {
+            // No nsec provided - check if user expects BYOK (has no keys) or auto-generate
+            // If user was registered without keys, they MUST provide nsec
+            tracing::error!("User {} has no personal_keys but no nsec in code_verifier", user_public_key);
+            return Err(OAuthError::InvalidRequest(
+                "Missing nsec in code_verifier. BYOK flow requires nsec to be embedded.".to_string()
+            ));
+        };
+
+        let secret_hex = keys.secret_key().to_secret_hex();
+        let encrypted_secret = key_manager
+            .encrypt(secret_hex.as_bytes())
+            .await
+            .map_err(|e| OAuthError::Encryption(e.to_string()))?;
+
+        // Insert personal_keys
+        sqlx::query(
+            "INSERT INTO personal_keys (user_public_key, encrypted_secret_key, created_at, updated_at)
+             VALUES ($1, $2, $3, $4)"
+        )
+        .bind(user_public_key)
+        .bind(&encrypted_secret)
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .execute(pool)
+        .await
+        .map_err(OAuthError::Database)?;
+
+        (encrypted_secret, true)
+    };
 
     // OAuth apps don't get UCAN tokens (no admin API access needed)
     // They only need bunker URL for NIP-46 remote signing
@@ -1272,12 +1328,13 @@ async fn create_oauth_authorization_and_token(
         connection_secret
     );
 
+    // Return bunker URL (no cookie - SSO cookie already set during oauth_register/oauth_login)
     Ok(Json(TokenResponse {
         bunker_url,
         token_type: "Bearer".to_string(),
-        expires_in: 0,  // Bunker URLs don't expire
+        expires_in: 0,
         scope: Some(scope.to_string()),
-    }))
+    }).into_response())
 }
 
 // ============================================================================
@@ -1329,13 +1386,18 @@ pub async fn oauth_login(
     }
 
     // Get user's keys for UCAN generation
-    let encrypted_secret: Vec<u8> = sqlx::query_scalar(
+    let encrypted_secret: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT encrypted_secret_key FROM personal_keys WHERE user_public_key = $1"
     )
     .bind(&public_key)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .map_err(OAuthError::Database)?;
+
+    let encrypted_secret = encrypted_secret.ok_or_else(|| {
+        tracing::warn!("User {} has no personal_keys - they registered via OAuth but haven't completed token exchange yet", public_key);
+        OAuthError::InvalidRequest("Account setup incomplete. Please complete the OAuth flow to finalize your account.".to_string())
+    })?;
 
     let decrypted_secret = key_manager
         .decrypt(&encrypted_secret)
@@ -1380,8 +1442,9 @@ pub struct OAuthRegisterRequest {
     pub scope: Option<String>,
     pub code_challenge: Option<String>,
     pub code_challenge_method: Option<String>,
-    pub nsec: Option<String>,  // Optional: BYOK
+    pub pubkey: Option<String>,  // Optional: for BYOK flow (hex), nsec will come in code_verifier
     pub relays: Option<Vec<String>>,  // Optional: preferred relays
+    pub state: Option<String>,  // Optional: for iOS PWA polling pattern
 }
 
 /// POST /oauth/register
@@ -1392,24 +1455,14 @@ pub async fn oauth_register(
     State(auth_state): State<super::routes::AuthState>,
     Json(req): Json<OAuthRegisterRequest>,
 ) -> Result<impl IntoResponse, OAuthError> {
-    use super::auth::{generate_ucan_token, RegisterRequest};
     let pool = &auth_state.state.db;
-    let key_manager = auth_state.state.key_manager.as_ref();
     let tenant_id = tenant.0.id;
 
     tracing::info!("OAuth popup registration for email: {} in tenant: {}", req.email, tenant_id);
 
-    // Use the existing registration logic from auth module
-    let register_req = RegisterRequest {
-        email: req.email.clone(),
-        password: req.password.clone(),
-        nsec: req.nsec.clone(),
-        relays: req.relays.clone(),
-    };
-
     // Check if email already exists
     let existing: Option<(String,)> = sqlx::query_as("SELECT public_key FROM users WHERE email = $1 AND tenant_id = $2")
-        .bind(&register_req.email)
+        .bind(&req.email)
         .bind(tenant_id)
         .fetch_optional(pool)
         .await
@@ -1420,28 +1473,25 @@ pub async fn oauth_register(
     }
 
     // Hash password
-    let password_hash = bcrypt::hash(&register_req.password, bcrypt::DEFAULT_COST)
+    let password_hash = bcrypt::hash(&req.password, bcrypt::DEFAULT_COST)
         .map_err(|_| OAuthError::InvalidRequest("Password hashing failed".to_string()))?;
 
-    // Generate keys (or use provided)
-    let keys = if let Some(ref nsec_str) = register_req.nsec {
-        Keys::parse(nsec_str)
-            .map_err(|e| OAuthError::InvalidRequest(format!("Invalid nsec: {}", e)))?
+    // Determine flow: BYOK (pubkey provided) vs auto-generate (no pubkey)
+    let (public_key, generated_keys) = if let Some(ref pubkey_hex) = req.pubkey {
+        // BYOK flow: client provides pubkey, nsec will come in code_verifier
+        let pubkey = nostr_sdk::PublicKey::from_hex(pubkey_hex)
+            .map_err(|e| OAuthError::InvalidRequest(format!("Invalid pubkey: {}", e)))?;
+        tracing::info!("OAuth registration BYOK flow for pubkey: {}", pubkey.to_hex());
+        (pubkey, None)  // No keys generated, wait for token exchange
     } else {
-        Keys::generate()
+        // Auto-generate flow: server generates keys immediately
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        tracing::info!("OAuth registration auto-generate flow for email: {}", req.email);
+        (pubkey, Some(keys))  // Keys generated now
     };
 
-    let public_key = keys.public_key();
-    let secret_key = keys.secret_key();
-
-    // Encrypt secret key (as hex string for UTF-8 compatibility)
-    let secret_hex = secret_key.to_secret_hex();
-    let encrypted_secret = key_manager
-        .encrypt(secret_hex.as_bytes())
-        .await
-        .map_err(|e| OAuthError::Encryption(e.to_string()))?;
-
-    // Start transaction
+    // Start transaction for user + optional keys creation
     let mut tx = pool.begin().await.map_err(OAuthError::Database)?;
 
     // Insert user
@@ -1451,7 +1501,7 @@ pub async fn oauth_register(
     )
     .bind(public_key.to_hex())
     .bind(tenant_id)
-    .bind(&register_req.email)
+    .bind(&req.email)
     .bind(&password_hash)
     .bind(false)
     .bind(Utc::now())
@@ -1460,41 +1510,121 @@ pub async fn oauth_register(
     .await
     .map_err(OAuthError::Database)?;
 
-    // Insert personal key
-    sqlx::query(
-        "INSERT INTO personal_keys (user_public_key, encrypted_secret_key, created_at, updated_at)
-         VALUES ($1, $2, $3, $4)"
-    )
-    .bind(public_key.to_hex())
-    .bind(&encrypted_secret)
-    .bind(Utc::now())
-    .bind(Utc::now())
-    .execute(&mut *tx)
-    .await
-    .map_err(OAuthError::Database)?;
+    // If auto-generate flow, create personal_keys immediately
+    if let Some(ref keys) = generated_keys {
+        let secret_hex = keys.secret_key().to_secret_hex();
+        let encrypted_secret = auth_state.state.key_manager.encrypt(secret_hex.as_bytes())
+            .await
+            .map_err(|e| OAuthError::Encryption(e.to_string()))?;
+
+        sqlx::query(
+            "INSERT INTO personal_keys (user_public_key, encrypted_secret_key, created_at, updated_at)
+             VALUES ($1, $2, $3, $4)"
+        )
+        .bind(public_key.to_hex())
+        .bind(&encrypted_secret)
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .execute(&mut *tx)
+        .await
+        .map_err(OAuthError::Database)?;
+
+        tracing::info!("Created personal_keys for auto-generate flow: {}", public_key.to_hex());
+    } else {
+        tracing::info!("BYOK flow - personal_keys will be created during token exchange: {}", public_key.to_hex());
+    }
 
     tx.commit().await.map_err(OAuthError::Database)?;
 
-    // Generate UCAN token with optional relays from request
-    let relays_slice = req.relays.as_deref();
-    let ucan_token = generate_ucan_token(&keys, tenant_id, &register_req.email, relays_slice).await
-        .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
+    // Auto-approve: first-time registration implies consent
+    // Generate authorization code immediately
+    let code: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
 
-    // OAuth popup register: bunker authorization will be created manually by user if needed
+    let expires_at = Utc::now() + Duration::minutes(10);
 
-    tracing::info!("OAuth popup registration successful for user: {}", public_key.to_hex());
+    // Get or create application
+    let app_id: Option<i32> =
+        sqlx::query_scalar("SELECT id FROM oauth_applications WHERE tenant_id = $1 AND client_id = $2")
+            .bind(tenant_id)
+            .bind(&req.client_id)
+            .fetch_optional(pool)
+            .await?;
 
-    // Set cookie and return success - page will reload to show approval
+    let app_id = if let Some(id) = app_id {
+        id
+    } else {
+        // Create application
+        sqlx::query_scalar(
+            "INSERT INTO oauth_applications (tenant_id, client_id, client_secret, name, redirect_uris, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id"
+        )
+        .bind(tenant_id)
+        .bind(&req.client_id)
+        .bind("test_secret")
+        .bind(&req.client_id)
+        .bind(format!("[\"{}\"]", req.redirect_uri))
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .fetch_one(pool)
+        .await?
+    };
+
+    // Store authorization code with PKCE support
+    sqlx::query(
+        "INSERT INTO oauth_codes (tenant_id, code, user_public_key, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+    )
+    .bind(tenant_id)
+    .bind(&code)
+    .bind(&public_key.to_hex())
+    .bind(app_id)
+    .bind(&req.redirect_uri)
+    .bind(req.scope.as_deref().unwrap_or("sign_event"))
+    .bind(&req.code_challenge)
+    .bind(&req.code_challenge_method)
+    .bind(expires_at)
+    .bind(Utc::now())
+    .execute(pool)
+    .await?;
+
+    tracing::info!("OAuth auto-approve for new registration: user {}, app {}", public_key.to_hex(), req.client_id);
+
+    // Generate UCAN for SSO
+    let ucan_token = if let Some(ref keys) = generated_keys {
+        // Auto-generate flow: user-signed UCAN (user has keys)
+        super::auth::generate_ucan_token(keys, tenant_id, &req.email, req.relays.as_deref()).await
+            .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?
+    } else {
+        // BYOK flow: server-signed UCAN (user doesn't have keys yet)
+        super::auth::generate_server_signed_ucan(&public_key, tenant_id, &req.email, &auth_state.state.server_keys).await
+            .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?
+    };
+
+    // Set UCAN cookie for SSO across OAuth apps
     let cookie = format!(
         "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400",
         ucan_token
     );
 
+    tracing::info!("Set server-signed UCAN cookie for user {} (SSO enabled)", public_key.to_hex());
+
+    // If state provided (iOS PWA polling flow), store code in polling cache
+    if let Some(ref state) = req.state {
+        let expiry = Instant::now();  // Will be checked with elapsed()
+        POLLING_CACHE.insert(state.clone(), (code.clone(), expiry));
+        tracing::info!("Stored code in polling cache for state: {}", state);
+    }
+
+    // Return code with cookie (auto-approve)
     Ok((
         [(axum::http::header::SET_COOKIE, cookie)],
         Json(serde_json::json!({
-            "success": true,
-            "pubkey": public_key.to_hex()
+            "code": code,
+            "redirect_uri": req.redirect_uri
         }))
     ).into_response())
 }
@@ -1903,4 +2033,55 @@ pub async fn connect_post(
 </body>
 </html>
     "#).into_response())
+}
+
+// ============================================================================
+// Polling Endpoint for iOS PWA OAuth Flow
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct PollRequest {
+    pub state: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PollResponse {
+    pub code: String,
+}
+
+/// GET /oauth/poll?state={state}
+/// Polling endpoint for iOS PWA OAuth flow (where redirect doesn't work)
+/// Returns HTTP 200 with code when ready, HTTP 202 if pending, HTTP 404 if not found/expired
+pub async fn poll(
+    Query(req): Query<PollRequest>,
+) -> Result<Response, OAuthError> {
+    // Clean up expired entries lazily
+    POLLING_CACHE.retain(|_, (_, expiry)| expiry.elapsed() < POLLING_TTL);
+
+    // Check if code is ready
+    if let Some(entry) = POLLING_CACHE.get(&req.state) {
+        let (code, expiry) = entry.value();
+
+        // Check if expired
+        if expiry.elapsed() >= POLLING_TTL {
+            POLLING_CACHE.remove(&req.state);
+            return Err(OAuthError::InvalidRequest("State expired".to_string()));
+        }
+
+        // Code ready - return and remove from cache (one-time use)
+        let code = code.clone();
+        drop(entry);  // Release lock before removing
+        POLLING_CACHE.remove(&req.state);
+
+        Ok((
+            StatusCode::OK,
+            Json(PollResponse { code })
+        ).into_response())
+    } else {
+        // Code not ready yet - return 202 Accepted
+        Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "pending" }))
+        ).into_response())
+    }
 }

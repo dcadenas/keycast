@@ -3,8 +3,20 @@
 use anyhow::{Result, anyhow};
 use axum::http::HeaderMap;
 use ucan::Ucan;
+use once_cell::sync::Lazy;
+use std::env;
 
 use super::did::did_to_nostr_pubkey;
+
+/// Server public key for validating server-signed UCANs
+/// Loaded from SERVER_NSEC environment variable
+static SERVER_PUBKEY: Lazy<String> = Lazy::new(|| {
+    env::var("SERVER_NSEC")
+        .ok()
+        .and_then(|nsec| nostr_sdk::Keys::parse(&nsec).ok())
+        .map(|k| k.public_key().to_hex())
+        .expect("SERVER_NSEC must be set and valid")
+});
 
 /// Validate UCAN token from Authorization header
 ///
@@ -50,11 +62,24 @@ pub fn validate_ucan_token(
         }
     }
 
-    // Extract user pubkey from issuer DID
-    let issuer_did = ucan.issuer();
-    let user_pubkey = did_to_nostr_pubkey(issuer_did)?;
+    // Extract user pubkey from audience DID (works for both user-signed and server-signed)
+    let user_pubkey = did_to_nostr_pubkey(ucan.audience())?;
 
-    Ok((user_pubkey.to_hex(), ucan))
+    // Verify issuer is either the user (self-issued) or server (delegated)
+    let issuer_pubkey = did_to_nostr_pubkey(ucan.issuer())?;
+    let issuer_pubkey_hex = issuer_pubkey.to_hex();
+    let user_pubkey_hex = user_pubkey.to_hex();
+
+    if issuer_pubkey_hex != user_pubkey_hex && issuer_pubkey_hex != *SERVER_PUBKEY {
+        return Err(anyhow!(
+            "Invalid UCAN issuer: must be signed by user ({}) or server ({}), got {}",
+            &user_pubkey_hex[..8],
+            &SERVER_PUBKEY[..8],
+            &issuer_pubkey_hex[..8]
+        ));
+    }
+
+    Ok((user_pubkey_hex, ucan))
 }
 
 /// Extract user pubkey from UCAN in Authorization header

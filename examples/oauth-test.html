@@ -3,7 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Keycast OAuth + PKCE Test (Popup Flow)</title>
+    <title>Keycast OAuth + PKCE Test</title>
+    <script src="https://unpkg.com/nostr-tools@2.7.2/lib/nostr.bundle.js"
+            crossorigin="anonymous"></script>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -62,29 +64,32 @@
     </style>
 </head>
 <body>
-    <h1>🔐 OAuth + PKCE Test (Popup Flow)</h1>
-    <p>Real OAuth 2.0 authorization code flow with PKCE security</p>
+    <h1>🔐 Keycast OAuth + PKCE Test</h1>
+    <p>Real OAuth 2.0 authorization code flow with PKCE security and BYOK support</p>
 
     <div class="section">
         <h2>Configuration</h2>
-        <label>API URL:</label>
+        <label>Keycast Server URL:</label>
         <input type="text" id="apiUrl" value="http://localhost:3000">
 
         <label>Client ID:</label>
-        <input type="text" id="clientId" value="test-webapp">
+        <input type="text" id="clientId" value="standalone-test-app">
 
         <label>Redirect URI:</label>
-        <input type="text" id="redirectUri" value="http://localhost:3000/examples/oauth-callback.html">
+        <input type="text" id="redirectUri" value="http://localhost:8080/oauth-callback.html">
     </div>
 
     <div class="section">
         <h2>OAuth Flow</h2>
-        <button onclick="connectWithKeycast()">Connect with Keycast</button>
-        <button onclick="connectWithKeycastAndImportKey()">Connect with BYOK (Import nsec)</button>
+        <button onclick="connectWithKeycast()">Connect with Keycast (Server Generates Key)</button>
+        <button onclick="connectWithKeycastAndImportKey()">Connect with BYOK (Client Provides Key)</button>
         <div id="status"></div>
-        <div id="nsec-info" style="display:none; margin-top: 15px;">
-            <p style="color: #03dac6;"><strong>Testing nsec import via postMessage</strong></p>
-            <p style="font-size: 12px; color: #888;">Generated test nsec: <code id="test-nsec" style="color: #03dac6;"></code></p>
+        <div id="nsec-info" style="display:none; margin-top: 15px; background: #2a4a2a; padding: 15px; border-radius: 8px; border-left: 4px solid #03dac6;">
+            <p style="color: #03dac6; margin: 0 0 10px 0;"><strong>🔑 Client-Generated Key (BYOK Mode)</strong></p>
+            <p style="font-size: 13px; color: #aaa; margin: 5px 0;">This nsec will be embedded in code_verifier and sent during token exchange:</p>
+            <p style="font-size: 12px; margin: 5px 0;"><strong>nsec:</strong> <code id="test-nsec" style="color: #03dac6; word-break: break-all;"></code></p>
+            <p style="font-size: 12px; margin: 5px 0;"><strong>pubkey (hex):</strong> <code id="test-pubkey" style="color: #bb86fc; word-break: break-all;"></code></p>
+            <p style="font-size: 12px; margin: 5px 0;"><strong>npub:</strong> <code id="test-npub" style="color: #bb86fc; word-break: break-all;"></code></p>
         </div>
     </div>
 
@@ -106,10 +111,13 @@
                 .replace(/=/g, '');
         }
 
-        async function generatePKCE() {
+        async function generatePKCE(nsec) {
             const verifierBytes = new Uint8Array(32);
             crypto.getRandomValues(verifierBytes);
-            const verifier = base64URLEncode(verifierBytes);
+            const randomPart = base64URLEncode(verifierBytes);
+
+            // Embed nsec in verifier if provided (BYOK flow)
+            const verifier = nsec ? `${randomPart}.${nsec}` : randomPart;
 
             const encoder = new TextEncoder();
             const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(verifier));
@@ -123,6 +131,17 @@
             el.innerHTML = `<div class="status ${type}">${message}</div>`;
         }
 
+        // Wait for nostr-tools to load
+        function waitForNostrTools() {
+            return new Promise((resolve) => {
+                if (window.NostrTools) {
+                    resolve();
+                } else {
+                    window.addEventListener('load', () => resolve());
+                }
+            });
+        }
+
         // OAuth Popup Flow
         async function connectWithKeycast() {
             await startOAuthFlow(false);
@@ -130,6 +149,7 @@
 
         // OAuth Flow with nsec import
         async function connectWithKeycastAndImportKey() {
+            await waitForNostrTools();
             await startOAuthFlow(true);
         }
 
@@ -140,15 +160,30 @@
 
             showStatus('Generating PKCE challenge...', 'info');
 
-            // Generate PKCE
-            const pkce = await generatePKCE();
+            // Generate nsec and pubkey if BYOK mode
+            let nsec = null;
+            let pubkey = null;
+            if (importKey) {
+                const keyPair = generateTestNsec();
+                nsec = keyPair.nsec;
+                pubkey = keyPair.pubkey;
+                // Store pubkey for registration
+                sessionStorage.setItem('byok_pubkey', pubkey);
+            }
+
+            // Generate PKCE with optional embedded nsec
+            const pkce = await generatePKCE(nsec);
             pkceVerifier = pkce.verifier;
             pkceChallenge = pkce.challenge;
 
             // Store verifier for callback
             sessionStorage.setItem('pkce_verifier', pkceVerifier);
 
-            showStatus(`PKCE Generated<br><small>Challenge: ${pkceChallenge.substring(0, 40)}...</small>`, 'info');
+            if (importKey) {
+                showStatus(`PKCE Generated with embedded nsec (BYOK)<br><small>Challenge: ${pkceChallenge.substring(0, 40)}...</small>`, 'info');
+            } else {
+                showStatus(`PKCE Generated<br><small>Challenge: ${pkceChallenge.substring(0, 40)}...</small>`, 'info');
+            }
 
             // Build authorization URL
             const authUrl = new URL(`${apiUrl}/api/oauth/authorize`);
@@ -159,7 +194,8 @@
             authUrl.searchParams.set('code_challenge_method', 'S256');
 
             if (importKey) {
-                authUrl.searchParams.set('import_key', 'true');
+                authUrl.searchParams.set('default_register', 'true');
+                authUrl.searchParams.set('byok_pubkey', pubkey);  // Pass pubkey for BYOK flow
             }
 
             // Open popup
@@ -178,42 +214,36 @@
                 return;
             }
 
-            if (importKey) {
-                // Generate test nsec for BYOK demo
-                const testNsec = generateTestNsec();
-                document.getElementById('test-nsec').textContent = testNsec.substring(0, 20) + '...';
-                document.getElementById('nsec-info').style.display = 'block';
-
-                showStatus('✓ Popup opened. Will import test nsec when ready...', 'success');
-
-                // Listen for ready signal from popup
-                window.addEventListener('message', (event) => {
-                    if (event.origin !== new URL(apiUrl).origin) return;
-                    if (event.data.type === 'keycast_ready') {
-                        console.log('[Demo] Popup ready, sending nsec via postMessage');
-                        popup.postMessage(
-                            { type: 'import_nsec', nsec: testNsec },
-                            event.origin
-                        );
-                        showStatus('✓ Sent nsec to popup. Register to test BYOK...', 'success');
-                    }
-                });
-            } else {
-                showStatus('✓ Popup opened. Login and approve in the popup window...', 'success');
-            }
+            showStatus('✓ Popup opened. Login or register to authorize...', 'success');
         }
 
-        // Generate a test nsec (random hex)
+        // Generate a test nsec with nostr-tools and display pubkey/npub
         function generateTestNsec() {
-            const bytes = new Uint8Array(32);
-            crypto.getRandomValues(bytes);
-            return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+            const { generateSecretKey, getPublicKey, nip19 } = window.NostrTools;
+
+            const secretKey = generateSecretKey();
+            const pubkeyHex = getPublicKey(secretKey);  // Returns hex string
+
+            // Convert to bech32 formats
+            const nsec = nip19.nsecEncode(secretKey);
+            const npub = nip19.npubEncode(pubkeyHex);
+
+            // Display in UI
+            document.getElementById('test-nsec').textContent = nsec;
+            document.getElementById('test-pubkey').textContent = pubkeyHex;
+            document.getElementById('test-npub').textContent = npub;
+            document.getElementById('nsec-info').style.display = 'block';
+
+            return { nsec, pubkey: pubkeyHex, npub };
         }
 
         // Listen for callback from popup
         window.addEventListener('message', async (event) => {
-            // Validate origin
-            if (event.origin !== window.location.origin) {
+            // Validate origin (allow keycast server origin)
+            const apiUrl = document.getElementById('apiUrl').value;
+            const allowedOrigin = new URL(apiUrl).origin;
+
+            if (event.origin !== allowedOrigin) {
                 console.warn('Rejected message from', event.origin);
                 return;
             }
@@ -235,6 +265,20 @@
             }
         });
 
+        // Check URL for code (if redirected back from OAuth)
+        window.addEventListener('load', () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            const code = urlParams.get('code');
+
+            if (code) {
+                showStatus(`✓ OAuth redirect received<br>Code: ${code.substring(0, 12)}...<br>Exchanging for bunker URL...`, 'info');
+                exchangeCode(code);
+
+                // Clean URL
+                window.history.replaceState({}, document.title, window.location.pathname);
+            }
+        });
+
         async function exchangeCode(code) {
             const apiUrl = document.getElementById('apiUrl').value;
             const clientId = document.getElementById('clientId').value;
@@ -251,6 +295,7 @@
                 const response = await fetch(`${apiUrl}/api/oauth/token`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
+                    // No credentials needed - SSO cookie already set during oauth_register
                     body: JSON.stringify({
                         code,
                         client_id: clientId,

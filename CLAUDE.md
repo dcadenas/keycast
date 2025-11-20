@@ -152,7 +152,8 @@ Key endpoints (see `api/src/api/http/routes.rs`):
 
 **OAuth (Third-Party)**:
 - `/api/oauth/authorize`: OAuth authorization flow (GET shows approval page, POST processes approval)
-- `/api/oauth/token`: Exchange authorization code for bunker URL
+- `/api/oauth/token`: Exchange authorization code for bunker URL with PKCE
+- `/api/oauth/poll?state={state}`: Poll for authorization code (iOS PWA pattern). Returns HTTP 200 with code when ready, HTTP 202 if pending, HTTP 404 if expired
 - CORS: Permissive (any origin)
 
 **User Management (NIP-98 Auth Required)**:
@@ -170,6 +171,7 @@ Required (set in `.env` or docker-compose):
 - `DATABASE_URL`: PostgreSQL connection string (e.g., `postgres://postgres:password@localhost/keycast`)
 - `POSTGRES_PASSWORD`: PostgreSQL password (for docker-compose)
 - `ALLOWED_ORIGINS`: Comma-separated CORS origins (e.g., `https://app.keycast.com,http://localhost:5173`)
+- `SERVER_NSEC`: Server Nostr secret key for signing UCANs (hex 64 chars or nsec bech32). Generate with `openssl rand -hex 32`. Used for server-signed session tokens for users without personal keys yet.
 - `DOMAIN`: Domain name for production deployment (docker-compose only)
 
 Optional:

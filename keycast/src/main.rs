@@ -9,6 +9,7 @@ use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::gcp_key_manager::GcpKeyManager;
 use keycast_core::encryption::KeyManager;
 use keycast_signer::UnifiedSigner;
+use nostr_sdk::Keys;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -85,6 +86,10 @@ fn validate_environment() -> Result<(), String> {
 
     if env::var("ALLOWED_ORIGINS").is_err() {
         errors.push("ALLOWED_ORIGINS must be set (comma-separated CORS origins)");
+    }
+
+    if env::var("SERVER_NSEC").is_err() {
+        errors.push("SERVER_NSEC must be set (server's Nostr secret key for signing UCANs)");
     }
 
     // Master key validation (either file or GCP KMS)
@@ -165,6 +170,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(FileKeyManager::new()?)
     };
 
+    // Load server keys for signing UCANs
+    let server_nsec = env::var("SERVER_NSEC")?; // Validated above
+    let server_keys = Keys::parse(&server_nsec)
+        .map_err(|e| format!("Invalid SERVER_NSEC: {}. Must be valid hex (64 chars) or nsec bech32.", e))?;
+    tracing::info!("✔︎ Server keys loaded (pubkey: {})", server_keys.public_key().to_hex());
+
     // Create authorization channel for instant communication between API and Signer
     let (auth_tx, auth_rx) = authorization_channel::create_channel();
     tracing::info!("✔︎ Authorization channel created (buffer size: {})", authorization_channel::CHANNEL_BUFFER_SIZE);
@@ -178,11 +189,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get shared handlers for API (converted to trait objects)
     let signer_handlers = signer.handlers_as_trait_objects().await;
 
-    // Create API state with shared signer handlers
+    // Create API state with shared signer handlers and server keys
     let api_state = Arc::new(keycast_api::state::KeycastState {
         db: database.pool.clone(),
         key_manager: Arc::new(api_key_manager),
         signer_handlers: Some(signer_handlers),
+        server_keys,
     });
 
     // Set global state for routes that use it

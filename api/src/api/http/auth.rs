@@ -73,6 +73,41 @@ pub(crate) async fn generate_ucan_token(
         .map_err(|e| AuthError::Internal(format!("Failed to encode UCAN: {}", e)))
 }
 
+/// Generate server-signed UCAN for users without personal keys yet
+/// Used during OAuth registration before keys are created
+pub(crate) async fn generate_server_signed_ucan(
+    user_pubkey: &nostr_sdk::PublicKey,
+    tenant_id: i64,
+    email: &str,
+    server_keys: &Keys,
+) -> Result<String, AuthError> {
+    use crate::ucan_auth::{NostrKeyMaterial, nostr_pubkey_to_did};
+    use ucan::builder::UcanBuilder;
+    use serde_json::json;
+
+    let server_key_material = NostrKeyMaterial::from_keys(server_keys.clone());
+    let user_did = nostr_pubkey_to_did(user_pubkey);
+
+    let facts = json!({
+        "tenant_id": tenant_id,
+        "email": email,
+    });
+
+    let ucan = UcanBuilder::default()
+        .issued_by(&server_key_material)  // Server issues
+        .for_audience(&user_did)           // For this user
+        .with_lifetime((TOKEN_EXPIRY_HOURS * 3600) as u64)
+        .with_fact(facts)
+        .build()
+        .map_err(|e| AuthError::Internal(format!("Failed to build UCAN: {}", e)))?
+        .sign()
+        .await
+        .map_err(|e| AuthError::Internal(format!("Failed to sign UCAN: {}", e)))?;
+
+    ucan.encode()
+        .map_err(|e| AuthError::Internal(format!("Failed to encode UCAN: {}", e)))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
     pub email: String,

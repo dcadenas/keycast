@@ -45,7 +45,8 @@
       "Bash(rm:*)",
       "Bash(ssh:*)",
       "Bash(env)",
-      "Bash(docker buildx:*)"
+      "Bash(docker buildx:*)",
+      "WebFetch(domain:developers.googleblog.com)"
     ],
     "deny": [],
     "ask": []

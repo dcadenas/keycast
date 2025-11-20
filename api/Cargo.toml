@@ -14,6 +14,7 @@ bcrypt = "0.15"
 bip39 = "2.0"
 chrono = { workspace = true }
 config = { workspace = true }
+dashmap = "6.1"
 dotenv = { workspace = true }
 keycast_core = { path = "../core" }
 # UCAN for user-signed capability tokens

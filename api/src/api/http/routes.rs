@@ -52,6 +52,7 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
         .route("/oauth/authorize", get(oauth::authorize_get))
         .route("/oauth/authorize", post(oauth::authorize_post))
         .route("/oauth/token", post(oauth::token))
+        .route("/oauth/poll", get(oauth::poll))  // iOS PWA polling endpoint
         .route("/oauth/connect", post(oauth::connect_post))
         .layer(public_cors.clone())
         .with_state(auth_state.clone());
