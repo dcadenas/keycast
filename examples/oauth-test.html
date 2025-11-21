@@ -83,6 +83,7 @@
         <h2>OAuth Flow</h2>
         <button onclick="connectWithKeycast()">Connect with Keycast (Server Generates Key)</button>
         <button onclick="connectWithKeycastAndImportKey()">Connect with BYOK (Client Provides Key)</button>
+        <button onclick="connectWithPolling()">Test iOS PWA Polling Pattern</button>
         <div id="status"></div>
         <div id="nsec-info" style="display:none; margin-top: 15px; background: #2a4a2a; padding: 15px; border-radius: 8px; border-left: 4px solid #03dac6;">
             <p style="color: #03dac6; margin: 0 0 10px 0;"><strong>🔑 Client-Generated Key (BYOK Mode)</strong></p>
@@ -150,10 +151,15 @@
         // OAuth Flow with nsec import
         async function connectWithKeycastAndImportKey() {
             await waitForNostrTools();
-            await startOAuthFlow(true);
+            await startOAuthFlow(true, false);
         }
 
-        async function startOAuthFlow(importKey) {
+        // Test iOS PWA polling pattern
+        async function connectWithPolling() {
+            await startOAuthFlow(false, true);
+        }
+
+        async function startOAuthFlow(importKey, usePolling) {
             const apiUrl = document.getElementById('apiUrl').value;
             const clientId = document.getElementById('clientId').value;
             const redirectUri = document.getElementById('redirectUri').value;
@@ -185,6 +191,14 @@
                 showStatus(`PKCE Generated<br><small>Challenge: ${pkceChallenge.substring(0, 40)}...</small>`, 'info');
             }
 
+            // Generate state for polling flow
+            let state = null;
+            if (usePolling) {
+                state = crypto.randomUUID();
+                sessionStorage.setItem('oauth_state', state);
+                showStatus(`Generated state token for polling: ${state.substring(0, 16)}...`, 'info');
+            }
+
             // Build authorization URL
             const authUrl = new URL(`${apiUrl}/api/oauth/authorize`);
             authUrl.searchParams.set('client_id', clientId);
@@ -192,6 +206,10 @@
             authUrl.searchParams.set('scope', 'sign_event encrypt decrypt');
             authUrl.searchParams.set('code_challenge', pkceChallenge);
             authUrl.searchParams.set('code_challenge_method', 'S256');
+
+            if (state) {
+                authUrl.searchParams.set('state', state);  // iOS PWA polling
+            }
 
             if (importKey) {
                 authUrl.searchParams.set('default_register', 'true');
@@ -214,7 +232,42 @@
                 return;
             }
 
-            showStatus('✓ Popup opened. Login or register to authorize...', 'success');
+            if (usePolling) {
+                showStatus('✓ Popup opened. After authorization, close popup manually and polling will begin...', 'info');
+                // Start polling when popup closes
+                const pollInterval = setInterval(async () => {
+                    const state = sessionStorage.getItem('oauth_state');
+                    if (!state) {
+                        clearInterval(pollInterval);
+                        return;
+                    }
+
+                    try {
+                        const response = await fetch(`${apiUrl}/api/oauth/poll?state=${state}`);
+
+                        if (response.status === 200) {
+                            // Code ready!
+                            clearInterval(pollInterval);
+                            const data = await response.json();
+                            showStatus(`✓ Code received via polling: ${data.code.substring(0, 12)}...<br>Exchanging for bunker URL...`, 'info');
+                            sessionStorage.removeItem('oauth_state');
+                            await exchangeCode(data.code);
+                        } else if (response.status === 202) {
+                            // Still pending
+                            showStatus('⏳ Polling for authorization code... (HTTP 202)', 'info');
+                        } else {
+                            // Error or expired
+                            clearInterval(pollInterval);
+                            showStatus(`✗ Polling failed: ${response.status}`, 'error');
+                            sessionStorage.removeItem('oauth_state');
+                        }
+                    } catch (error) {
+                        showStatus(`⚠️ Polling error: ${error.message}`, 'error');
+                    }
+                }, 2000);  // Poll every 2 seconds
+            } else {
+                showStatus('✓ Popup opened. Login or register to authorize...', 'success');
+            }
         }
 
         // Generate a test nsec with nostr-tools and display pubkey/npub

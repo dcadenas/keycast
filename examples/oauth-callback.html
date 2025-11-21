@@ -28,16 +28,31 @@
 
     <script>
         // OAuth Callback Handler
-        // This page receives the authorization code and sends it back to the opener
+        // Handles both popup flow (postMessage) and iOS PWA flow (polling pattern)
 
         const params = new URLSearchParams(window.location.search);
         const code = params.get('code');
+        const state = params.get('state');
         const error = params.get('error');
         const errorDescription = params.get('error_description');
 
         const messageEl = document.getElementById('message');
 
-        if (window.opener) {
+        // Detect flow based on state parameter
+        if (state) {
+            // iOS PWA flow: state-based polling
+            // Code is already stored server-side in polling cache
+            // Parent PWA will poll /oauth/poll?state={state} to retrieve it
+
+            if (code) {
+                messageEl.className = 'message success';
+                messageEl.textContent = '✓ Authorization complete. Please return to your app.';
+            } else {
+                messageEl.className = 'message error';
+                messageEl.textContent = `✗ Authorization ${error || 'failed'}`;
+            }
+        } else if (window.opener) {
+            // Popup flow: postMessage to parent
             const message = {
                 type: 'oauth_callback',
                 ...(code && { code }),
@@ -45,7 +60,6 @@
                 ...(errorDescription && { error_description: errorDescription }),
             };
 
-            // Send message to parent window with origin validation
             try {
                 window.opener.postMessage(message, window.location.origin);
 
@@ -57,10 +71,7 @@
                     messageEl.textContent = `✗ Authorization ${error || 'failed'}`;
                 }
 
-                // Auto-close popup after brief delay
-                setTimeout(() => {
-                    window.close();
-                }, 1000);
+                setTimeout(() => window.close(), 1000);
             } catch (e) {
                 messageEl.className = 'message error';
                 messageEl.textContent = 'Failed to communicate with parent window';
