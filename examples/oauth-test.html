@@ -70,13 +70,13 @@
     <div class="section">
         <h2>Configuration</h2>
         <label>Keycast Server URL:</label>
-        <input type="text" id="apiUrl" value="http://localhost:3000">
+        <input type="text" id="apiUrl" value="">
 
         <label>Client ID:</label>
         <input type="text" id="clientId" value="standalone-test-app">
 
         <label>Redirect URI:</label>
-        <input type="text" id="redirectUri" value="http://localhost:8080/oauth-callback.html">
+        <input type="text" id="redirectUri" value="">
     </div>
 
     <div class="section">
@@ -101,6 +101,19 @@
     </div>
 
     <script>
+        // Auto-detect environment
+        const isProduction = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
+        const defaultApiUrl = isProduction
+            ? `${window.location.protocol}//${window.location.host}`
+            : 'http://localhost:3000';
+        const defaultRedirectUri = isProduction
+            ? `${window.location.protocol}//${window.location.host}/examples/oauth-callback.html`
+            : 'http://localhost:8080/oauth-callback.html';
+
+        // Set defaults
+        document.getElementById('apiUrl').value = defaultApiUrl;
+        document.getElementById('redirectUri').value = defaultRedirectUri;
+
         let pkceVerifier = null;
         let pkceChallenge = null;
 
