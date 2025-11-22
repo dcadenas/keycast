@@ -1873,6 +1873,259 @@ pub async fn export_key(
     Ok(Json(ExportKeyResponse { key: key_string }))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ChangeKeyRequest {
+    pub password: String,
+    pub nsec: Option<String>,  // If None, auto-generate new key
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChangeKeyResponse {
+    pub success: bool,
+    pub new_pubkey: String,
+    pub message: String,
+}
+
+/// Simplified export that only requires password (no email verification)
+pub async fn export_key_simple(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<ExportKeyResponse>, AuthError> {
+    let user_pubkey = extract_user_from_token(&headers)?;
+    let pool = &auth_state.state.db;
+    let key_manager = auth_state.state.key_manager.as_ref();
+    let tenant_id = tenant.0.id;
+
+    // Extract password and format from request
+    let password = req.get("password")
+        .and_then(|v| v.as_str())
+        .ok_or(AuthError::BadRequest("Missing password".to_string()))?;
+
+    let format = req.get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("nsec");
+
+    // Verify password
+    let result: Option<(String, String)> = sqlx::query_as(
+        "SELECT email, password_hash FROM users WHERE public_key = $1 AND tenant_id = $2"
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let (_email, password_hash) = result.ok_or(AuthError::UserNotFound)?;
+
+    let valid = verify(password, &password_hash)
+        .map_err(|_| AuthError::Internal("Password verification failed".to_string()))?;
+
+    if !valid {
+        return Err(AuthError::InvalidCredentials);
+    }
+
+    // Get user's encrypted secret key
+    let encrypted_key: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT pk.encrypted_secret_key
+         FROM personal_keys pk
+         JOIN users u ON pk.user_public_key = u.public_key
+         WHERE pk.user_public_key = $1 AND u.tenant_id = $2"
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let encrypted_key = encrypted_key.ok_or(AuthError::UserNotFound)?;
+
+    // Decrypt the secret key
+    let decrypted_secret = key_manager
+        .decrypt(&encrypted_key)
+        .await
+        .map_err(|e| AuthError::Internal(format!("Failed to decrypt key: {}", e)))?;
+
+    // Parse the secret key
+    let keys = Keys::parse(&hex::encode(&decrypted_secret))
+        .map_err(|e| AuthError::Internal(format!("Failed to parse key: {}", e)))?;
+
+    // Format the key based on requested format
+    let key_string = match format {
+        "nsec" => keys.secret_key().to_bech32()
+            .map_err(|e| AuthError::Internal(format!("Failed to encode nsec: {}", e)))?,
+        _ => return Err(AuthError::BadRequest("Invalid format. Must be 'nsec'".to_string())),
+    };
+
+    // Log the export for security audit
+    sqlx::query(
+        "INSERT INTO key_export_log (user_public_key, format, exported_at) VALUES ($1, $2, $3)"
+    )
+    .bind(&user_pubkey)
+    .bind(format)
+    .bind(Utc::now())
+    .execute(pool)
+    .await?;
+
+    Ok(Json(ExportKeyResponse { key: key_string }))
+}
+
+/// Change user's private key - transfers email login to new identity
+/// WARNING: Deletes all OAuth authorizations (bunker connections)
+pub async fn change_key(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
+    Json(req): Json<ChangeKeyRequest>,
+) -> Result<Json<ChangeKeyResponse>, AuthError> {
+    let old_pubkey = extract_user_from_token(&headers)?;
+    let pool = &auth_state.state.db;
+    let key_manager = auth_state.state.key_manager.as_ref();
+    let tenant_id = tenant.0.id;
+
+    // Get user's email and verify password
+    let result: Option<(String, String)> = sqlx::query_as(
+        "SELECT email, password_hash FROM users WHERE public_key = $1 AND tenant_id = $2"
+    )
+    .bind(&old_pubkey)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let (email, password_hash) = result.ok_or(AuthError::UserNotFound)?;
+
+    // Verify password
+    let valid = verify(&req.password, &password_hash)
+        .map_err(|_| AuthError::Internal("Password verification failed".to_string()))?;
+
+    if !valid {
+        return Err(AuthError::InvalidCredentials);
+    }
+
+    // Generate or parse new key
+    let new_keys = if let Some(ref nsec_str) = req.nsec {
+        tracing::info!("User provided new key (BYOK) for change");
+        Keys::parse(nsec_str)
+            .map_err(|e| AuthError::Internal(format!("Invalid nsec or secret key: {}", e)))?
+    } else {
+        tracing::info!("Auto-generating new key for change");
+        Keys::generate()
+    };
+
+    let new_pubkey = new_keys.public_key().to_hex();
+    let new_secret_hex = new_keys.secret_key().to_secret_hex();
+
+    // Check if new pubkey already exists in this tenant
+    let exists: Option<(String,)> = sqlx::query_as(
+        "SELECT public_key FROM users WHERE public_key = $1 AND tenant_id = $2"
+    )
+    .bind(&new_pubkey)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if exists.is_some() {
+        return Err(AuthError::DuplicateKey);
+    }
+
+    // Encrypt new secret key
+    let encrypted_secret = key_manager
+        .encrypt(new_secret_hex.as_bytes())
+        .await
+        .map_err(|e| AuthError::Encryption(e.to_string()))?;
+
+    // Start transaction
+    let mut tx = pool.begin().await?;
+
+    // Count OAuth authorizations that will be deleted (for response message)
+    let oauth_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM oauth_authorizations WHERE user_public_key = $1"
+    )
+    .bind(&old_pubkey)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    // Delete OAuth authorizations (we can't sign with old nsec anymore)
+    sqlx::query(
+        "DELETE FROM oauth_authorizations WHERE user_public_key = $1"
+    )
+    .bind(&old_pubkey)
+    .execute(&mut *tx)
+    .await?;
+
+    // Delete old personal_keys (we no longer hold old nsec)
+    sqlx::query(
+        "DELETE FROM personal_keys WHERE user_public_key = $1"
+    )
+    .bind(&old_pubkey)
+    .execute(&mut *tx)
+    .await?;
+
+    // Transfer email/password to NULL on old identity (orphan it)
+    sqlx::query(
+        "UPDATE users SET email = NULL, password_hash = NULL, updated_at = $1
+         WHERE public_key = $2 AND tenant_id = $3"
+    )
+    .bind(Utc::now())
+    .bind(&old_pubkey)
+    .bind(tenant_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // Create new user identity with email/password
+    sqlx::query(
+        "INSERT INTO users (public_key, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)"
+    )
+    .bind(&new_pubkey)
+    .bind(tenant_id)
+    .bind(&email)
+    .bind(&password_hash)
+    .bind(true)  // Keep email verified status
+    .bind(Utc::now())
+    .bind(Utc::now())
+    .execute(&mut *tx)
+    .await?;
+
+    // Create personal_keys for new identity
+    sqlx::query(
+        "INSERT INTO personal_keys (user_public_key, encrypted_secret_key, created_at, updated_at)
+         VALUES ($1, $2, $3, $4)"
+    )
+    .bind(&new_pubkey)
+    .bind(&encrypted_secret)
+    .bind(Utc::now())
+    .bind(Utc::now())
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    // Signal signer daemon to remove old authorizations
+    if let Some(tx) = &auth_state.auth_tx {
+        use keycast_core::authorization_channel::AuthorizationCommand;
+        if let Err(e) = tx.send(AuthorizationCommand::Remove {
+            bunker_pubkey: old_pubkey.clone(),
+        }).await {
+            tracing::error!("Failed to send authorization remove command: {}", e);
+        }
+    }
+
+    tracing::info!(
+        "Successfully changed key for user {} → {} (deleted {} OAuth authorizations)",
+        old_pubkey, new_pubkey, oauth_count
+    );
+
+    Ok(Json(ChangeKeyResponse {
+        success: true,
+        new_pubkey: new_pubkey.clone(),
+        message: format!(
+            "Private key changed successfully. Deleted {} connected app(s). Your old identity ({}) still exists in teams if you backed up the old key.",
+            oauth_count,
+            &old_pubkey[..16]
+        ),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use keycast_core::encryption::file_key_manager::FileKeyManager;

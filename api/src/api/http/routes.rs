@@ -90,9 +90,16 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
         .layer(auth_cors.clone())
         .with_state(auth_state.clone());
 
-    // Key export final route (needs AuthState for key_manager)
-    let key_export_final = Router::new()
+    // Key export routes (need AuthState for key_manager)
+    let key_export_routes = Router::new()
         .route("/user/export-key", post(auth::export_key))
+        .route("/user/export-key-simple", post(auth::export_key_simple))
+        .layer(auth_cors.clone())
+        .with_state(auth_state.clone());
+
+    // Change key route (needs AuthState for key_manager and auth_tx)
+    let change_key_route = Router::new()
+        .route("/user/change-key", post(auth::change_key))
         .layer(auth_cors.clone())
         .with_state(auth_state.clone());
 
@@ -135,7 +142,8 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
         .merge(first_party_routes)      // Has auth_cors (credentials, needs cookies)
         .merge(user_routes)              // Has auth_cors (authenticated, needs cookies)
         .merge(bunker_routes)            // Has auth_cors (bunker creation)
-        .merge(key_export_final)         // Has auth_cors (authenticated, needs cookies)
+        .merge(key_export_routes)        // Has auth_cors (authenticated, needs cookies)
+        .merge(change_key_route)         // Has auth_cors (authenticated, needs cookies)
         .merge(email_routes.layer(public_cors.clone()))
         .merge(oauth_routes)             // Has public_cors (third-party safe)
         .merge(connect_routes.layer(public_cors.clone()))

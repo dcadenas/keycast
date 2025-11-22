@@ -224,6 +224,25 @@ onMount(async () => {
 					</div>
 					<ArrowRight size={20} class="stat-arrow" />
 				</div>
+
+				<!-- Security Settings Card (only for email/password users) -->
+				{#if authMethod === 'cookie'}
+					<!-- svelte-ignore a11y_click_events_have_key_events -->
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
+					<div class="stat-card clickable" onclick={() => window.location.href = '/settings/security'}>
+						<div class="stat-icon">
+							<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 256 256">
+								<path d="M208,80H176V56a48,48,0,0,0-96,0V80H48A16,16,0,0,0,32,96V208a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V96A16,16,0,0,0,208,80ZM96,56a32,32,0,0,1,64,0V80H96ZM208,208H48V96H208V208Zm-68-56a12,12,0,1,1-12-12A12,12,0,0,1,140,152Z"></path>
+							</svg>
+						</div>
+						<div class="stat-content">
+							<p class="stat-label">Security</p>
+							<p class="stat-value text-sm">Key Management</p>
+							<p class="stat-meta">Export or change your private key</p>
+						</div>
+						<ArrowRight size={20} class="stat-arrow" />
+					</div>
+				{/if}
 			</div>
 
 			<!-- Quick Actions -->
@@ -244,6 +263,14 @@ onMount(async () => {
 						<Users size={20} />
 						<span>View All Teams</span>
 					</a>
+					{#if authMethod === 'cookie'}
+						<a href="/settings/security" class="action-card">
+							<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 256 256">
+								<path d="M208,80H176V56a48,48,0,0,0-96,0V80H48A16,16,0,0,0,32,96V208a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V96A16,16,0,0,0,208,80ZM96,56a32,32,0,0,1,64,0V80H96ZM208,208H48V96H208V208Zm-68-56a12,12,0,1,1-12-12A12,12,0,0,1,140,152Z"></path>
+							</svg>
+							<span>Security Settings</span>
+						</a>
+					{/if}
 				</div>
 			</div>
 
