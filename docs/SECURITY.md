@@ -1,12 +1,16 @@
 # Security Policy
 
-## Security Model
+## Overview
 
 Keycast is a hosted NIP-46 (Nostr remote signer) bunker service. We take security seriously and implement multiple layers of protection for your Nostr keys.
 
+**For a comprehensive analysis of how Keycast compares to other Nostr key management solutions** (nsec.app, Amber, hardware wallets, etc.), see **[SECURITY_LADDER.md](./SECURITY_LADDER.md)** which provides an honest ranking of security levels and helps you choose the right solution for your needs.
+
+## Security Model
+
 ### At Rest (Storage)
 - ✅ **Keys encrypted** using GCP Cloud KMS with AES-256-GCM
-- ✅ **Encrypted blobs** stored in SQLite database
+- ✅ **Encrypted blobs** stored in PostgreSQL database
 - ✅ **Database encrypted** at rest by Cloud Run infrastructure
 - ✅ **KMS access controlled** via IAM with principle of least privilege
 
@@ -50,13 +54,23 @@ Keycast is a hosted NIP-46 (Nostr remote signer) bunker service. We take securit
 - ❌ Critical infrastructure keys
 - ❌ Accounts requiring regulatory compliance (SOC2, PCI-DSS)
 - ❌ Users in high-threat environments
+- ❌ Users who cannot trust the service provider
+
+**Alternative**: For maximum security, consider:
+- **Client-side**: nsec.app (browser-based, non-custodial)
+- **Mobile**: Amber (Android native, non-custodial)
+- **Hardware**: Dedicated signing devices
+- **Self-hosted**: Run your own Keycast instance
+
+See [SECURITY_LADDER.md](./SECURITY_LADDER.md) for detailed comparison.
 
 ### ✅ Recommended For
 
 - ✅ General social media posting on Nostr
+- ✅ Team accounts requiring policy enforcement
 - ✅ Low-to-medium value accounts
 - ✅ Convenience over maximum security use cases
-- ✅ Users who understand and accept the trade-offs
+- ✅ Users who trust the service provider OR plan to self-host
 
 ## Future Enhancements
 

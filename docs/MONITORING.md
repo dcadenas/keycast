@@ -76,7 +76,7 @@ gcloud error-reporting events list --project=openvine-co
 ### API Health Endpoint
 ```bash
 # Production
-curl https://oauth.divine.video/health
+curl https://login.divine.video/health
 
 # Local
 curl http://localhost:3000/health
@@ -85,7 +85,7 @@ curl http://localhost:3000/health
 ### Integration Tests
 Run comprehensive tests against production:
 ```bash
-API_URL=https://oauth.divine.video FRONTEND_URL=https://oauth.divine.video \
+API_URL=https://login.divine.video FRONTEND_URL=https://login.divine.video \
   ./tests/integration/test-api.sh
 ```
 
@@ -109,7 +109,7 @@ gcloud alpha monitoring policies create \
 gcloud alpha monitoring uptime create \
   --display-name="Keycast API Health" \
   --resource-type=uptime-url \
-  --monitored-resource=https://oauth.divine.video/health \
+  --monitored-resource=https://login.divine.video/health \
   --period=60s \
   --project=openvine-co
 ```

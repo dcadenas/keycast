@@ -22,7 +22,7 @@
 
 Keycast provides a custodial Nostr identity and remote signing service, making it easy for users to get started with Nostr without managing their own keys. The identity server offers two authentication approaches:
 
-- **Personal Authentication**: Simple email/password auth with JWT tokens (ideal for first-party apps)
+- **Personal Authentication**: Simple email/password auth with UCAN tokens (ideal for first-party apps)
 - **OAuth 2.0 Flow**: Industry-standard OAuth with per-application authorization (ideal for third-party apps)
 
 Both flows provide **NIP-46 bunker URLs** for remote signing, keeping private keys secure on the server while allowing clients to request signatures via Nostr relays.
@@ -31,7 +31,7 @@ Both flows provide **NIP-46 bunker URLs** for remote signing, keeping private ke
 
 - **Custodial Key Management**: Users get Nostr keys managed by Keycast
 - **Remote Signing (NIP-46)**: Sign events without exposing private keys
-- **JWT-based Sessions**: Secure 24-hour sessions with automatic login after registration
+- **UCAN-based Sessions**: Secure 24-hour sessions with automatic login after registration
 - **Per-App Authorization**: OAuth flow provides granular per-application access control
 - **Email Verification**: Optional email verification flow (emails sent if configured)
 - **Password Reset**: Secure password reset flow with time-limited tokens
@@ -87,7 +87,7 @@ Both flows provide **NIP-46 bunker URLs** for remote signing, keeping private ke
 #### 1. Register a New User
 
 ```javascript
-const API_URL = 'https://oauth.divine.video';
+const API_URL = 'https://login.divine.video';
 
 async function register(email, password) {
   const response = await fetch(`${API_URL}/api/auth/register`, {
@@ -214,7 +214,7 @@ async function authorizeOAuth(token, clientId, redirectUri) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}` // Use JWT token here
+      'Authorization': `Bearer ${token}` // Use UCAN token here
     },
     body: JSON.stringify({
       client_id: clientId,
@@ -322,7 +322,7 @@ Register a new user account.
 **Notes:**
 - Password must be at least 8 characters
 - Email verification sent if email service configured (optional)
-- Returns JWT token for immediate use (24-hour expiration)
+- Returns UCAN token for immediate use (24-hour expiration)
 - Creates personal Nostr keypair encrypted with KMS
 - Automatically creates OAuth authorization for `keycast-login` client
 
@@ -363,7 +363,7 @@ Get NIP-46 bunker URL for authenticated user.
 
 **Headers:**
 ```
-Authorization: Bearer {jwt_token}
+Authorization: Bearer {ucan_token}
 ```
 
 **Response (200 OK):**
@@ -458,7 +458,7 @@ User approves or denies OAuth authorization for an application.
 
 **Headers:**
 ```
-Authorization: Bearer {jwt_token}
+Authorization: Bearer {ucan_token}
 ```
 
 **Request:**
@@ -528,7 +528,7 @@ List all active bunker sessions for authenticated user.
 
 **Headers:**
 ```
-Authorization: Bearer {jwt_token}
+Authorization: Bearer {ucan_token}
 ```
 
 **Response (200 OK):**
@@ -557,7 +557,7 @@ Get activity log for a specific bunker session.
 
 **Headers:**
 ```
-Authorization: Bearer {jwt_token}
+Authorization: Bearer {ucan_token}
 ```
 
 **Response (200 OK):**
@@ -582,7 +582,7 @@ Revoke a bunker session.
 
 **Headers:**
 ```
-Authorization: Bearer {jwt_token}
+Authorization: Bearer {ucan_token}
 ```
 
 **Request:**
@@ -610,7 +610,7 @@ Get user profile (currently only returns username for NIP-05).
 
 **Headers:**
 ```
-Authorization: Bearer {jwt_token}
+Authorization: Bearer {ucan_token}
 ```
 
 **Response (200 OK):**
@@ -632,7 +632,7 @@ Update username (for NIP-05 identifier).
 
 **Headers:**
 ```
-Authorization: Bearer {jwt_token}
+Authorization: Bearer {ucan_token}
 ```
 
 **Request:**
@@ -662,9 +662,6 @@ Authorization: Bearer {jwt_token}
 ### Required Environment Variables
 
 ```bash
-# JWT Authentication (REQUIRED)
-JWT_SECRET=your-secure-random-secret-here
-
 # Database (defaults to ./database/keycast.db)
 DATABASE_PATH=./database/keycast.db
 
@@ -693,20 +690,15 @@ BASE_URL=https://yourdomain.com
 
 ### Security Recommendations
 
-1. **JWT_SECRET**:
-   - Generate with: `openssl rand -base64 32`
-   - Store in Google Secret Manager (production)
-   - Never commit to source control
-
-2. **Encryption Keys**:
+1. **Encryption Keys**:
    - **Development**: Use file-based encryption with master.key
    - **Production**: Use Google Cloud KMS for encryption at rest
 
-3. **CORS**:
+2. **CORS**:
    - API currently allows all origins for embeddable auth
    - Consider restricting in production to known domains
 
-4. **Rate Limiting**:
+3. **Rate Limiting**:
    - Consider implementing rate limiting on auth endpoints
    - Protect against brute force attacks
 
@@ -724,7 +716,12 @@ BASE_URL=https://yourdomain.com
 ### Authentication Security
 
 - **Password Hashing**: bcrypt with DEFAULT_COST (currently 12)
-- **JWT Expiration**: 24 hours
+- **UCAN Tokens**: User-signed capability tokens (not server-signed like traditional JWT)
+  - Tokens are signed by the user's Nostr key (ECDSA secp256k1)
+  - Server validates using the user's public key (no shared secret needed)
+  - Self-issued UCANs (issuer == audience)
+  - Follows UCAN specification for decentralized auth
+- **UCAN Expiration**: 24 hours
 - **Authorization Codes**: 10-minute expiration, single-use
 - **Email Verification Tokens**: 24-hour expiration
 - **Password Reset Tokens**: 1-hour expiration
@@ -732,7 +729,7 @@ BASE_URL=https://yourdomain.com
 ### Transport Security
 
 - **HTTPS Required**: All production deployments must use HTTPS
-- **Secure Cookies**: Use secure, httpOnly cookies for JWT tokens in production
+- **Secure Cookies**: Use secure, httpOnly cookies for UCAN tokens in production
 - **CORS**: Currently allows all origins; restrict in production
 
 ### Per-Application Security (OAuth)
@@ -907,7 +904,7 @@ await event.publish(); // Automatically signs via bunker
   </div>
 
   <script>
-    const API_URL = 'https://oauth.divine.video';
+    const API_URL = 'https://login.divine.video';
     let token = null;
     let bunkerUrl = null;
 
@@ -989,14 +986,6 @@ await event.publish(); // Automatically signs via bunker
 
 ### Common Issues
 
-#### "JWT_SECRET not set" Warning
-
-**Symptom:** Warning in logs about insecure JWT secret
-**Solution:** Set `JWT_SECRET` environment variable:
-```bash
-export JWT_SECRET=$(openssl rand -base64 32)
-```
-
 #### "Service temporarily unavailable"
 
 **Symptom:** Generic error message
@@ -1048,7 +1037,7 @@ export JWT_SECRET=$(openssl rand -base64 32)
 
 ### For Client Developers
 
-1. **Store JWT Securely**
+1. **Store UCAN Securely**
    - Use httpOnly, secure cookies in web apps
    - Use secure storage (Keychain/Keystore) in mobile apps
    - Never expose tokens in URLs or localStorage
@@ -1076,7 +1065,6 @@ export JWT_SECRET=$(openssl rand -base64 32)
 ### For Server Operators
 
 1. **Environment Security**
-   - Use Google Secret Manager for `JWT_SECRET` in production
    - Enable GCP KMS for production encryption
    - Never commit secrets to version control
 
@@ -1088,7 +1076,7 @@ export JWT_SECRET=$(openssl rand -base64 32)
 3. **Monitoring**
    - Monitor auth endpoint error rates
    - Alert on KMS encryption failures
-   - Track JWT validation failures (possible attacks)
+   - Track UCAN validation failures (possible attacks)
 
 4. **Rate Limiting**
    - Implement rate limiting on auth endpoints
@@ -1134,8 +1122,8 @@ export JWT_SECRET=$(openssl rand -base64 32)
 For issues, questions, or contributions:
 
 - **GitHub Issues:** https://github.com/rabble/keycast/issues
-- **Documentation:** https://oauth.divine.video/docs
-- **Examples:** https://oauth.divine.video/examples/
+- **Documentation:** https://login.divine.video/docs
+- **Examples:** https://login.divine.video/examples/
 
 ---
 

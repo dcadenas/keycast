@@ -1,9 +1,13 @@
 # Keycast Multi-Domain Architecture Summary
 
-## Overview
-Keycast is a NIP-46 remote signing service with OAuth 2.0 authorization, built in Rust using Axum web framework and SQLite. It enables users to sign into Nostr apps using email/password authentication with encrypted key management.
+> ⚠️ **DEPRECATED** - This document describes an outdated single-domain architecture.
+> The current system uses docker-compose with PostgreSQL persistent volumes.
+> See `/docs/ARCHITECTURE.md` and `/CLAUDE.md` for current architecture.
 
-**Current Deployment**: Single domain (oauth.divine.video) on Google Cloud Run with Litestream for SQLite persistence.
+## Overview
+Keycast is a NIP-46 remote signing service with OAuth 2.0 authorization, built in Rust using Axum web framework and PostgreSQL. It enables users to sign into Nostr apps using email/password authentication with encrypted key management.
+
+**Current Deployment**: Single domain (login.divine.video) on Google Cloud Run with Litestream for PostgreSQL persistence.
 
 ---
 
@@ -11,7 +15,7 @@ Keycast is a NIP-46 remote signing service with OAuth 2.0 authorization, built i
 
 ### Framework & Architecture
 - **Framework**: Axum 0.7 (Rust async HTTP framework)
-- **Database**: SQLite with SQLx ORM
+- **Database**: PostgreSQL with SQLx ORM
 - **Server**: Runs on Cloud Run, binds to 0.0.0.0 on port 8080 (via PORT env var)
 - **Process**: Single unified process serving API + static files
 
@@ -98,7 +102,6 @@ let cors = CorsLayer::new()
 #### 1. JWT Token (Bearer Token)
 - **Type**: HS256 (symmetric)
 - **Expiry**: 24 hours
-- **Secret**: `JWT_SECRET` environment variable
 - **Header Format**: `Authorization: Bearer <token>`
 - **Claims**: 
   ```json
@@ -229,7 +232,7 @@ CREATE TABLE oauth_authorizations (
 
 ### Current Configuration
 **Single Domain Architecture**:
-- API: `https://oauth.divine.video`
+- API: `https://login.divine.video`
 - All static HTML served from same domain
 - All examples served from same domain
 
@@ -237,8 +240,8 @@ CREATE TABLE oauth_authorizations (
 **Location**: `service.yaml` and `.env.production`
 
 ```yaml
-CORS_ALLOWED_ORIGIN: https://oauth.divine.video
-APP_URL: https://oauth.divine.video
+CORS_ALLOWED_ORIGIN: https://login.divine.video
+APP_URL: https://login.divine.video
 FROM_EMAIL: noreply@divine.video
 ```
 
@@ -258,7 +261,7 @@ Returns:
 }
 ```
 
-This enables `username@oauth.divine.video` NIP-05 identifiers.
+This enables `username@login.divine.video` NIP-05 identifiers.
 
 ### Hardcoded Domain References
 - **Relay URL**: Hardcoded to `wss://relay.damus.io` in multiple places
@@ -387,7 +390,7 @@ Enables user to see which apps signed which events and when.
 
 **Key Features**:
 - Knative serving (Google Cloud Run native)
-- Litestream for SQLite replication to Cloud Storage
+- Litestream for PostgreSQL replication to Cloud Storage
 - Gen2 execution environment
 - Database in emptyDir (500Mi limit) with Litestream backup
 - Two containers per service:
@@ -400,7 +403,6 @@ Enables user to see which apps signed which events and when.
 - `RUST_LOG`: `info`
 - `USE_GCP_KMS`: `true` (production)
 - `GCP_PROJECT_ID`: `openvine-co`
-- Secrets injected: JWT_SECRET, SENDGRID_API_KEY, MASTER_KEY_PATH
 
 ---
 
@@ -424,8 +426,8 @@ Enables user to see which apps signed which events and when.
    - Can be replaced with alternative frontend
 
 4. **NIP-05 Domain**
-   - Currently: `oauth.divine.video`
-   - Uses `username@oauth.divine.video` format
+   - Currently: `login.divine.video`
+   - Uses `username@login.divine.video` format
    - Would need per-tenant configuration for multi-domain
 
 ### Limitation: Single Branding

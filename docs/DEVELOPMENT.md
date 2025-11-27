@@ -44,7 +44,7 @@ gcloud builds submit --config=cloudbuild.yaml --project=openvine-co
 ./tests/integration/test-api.sh
 
 # Production
-API_URL=https://oauth.divine.video FRONTEND_URL=https://oauth.divine.video \
+API_URL=https://login.divine.video FRONTEND_URL=https://login.divine.video \
   ./tests/integration/test-api.sh
 ```
 Tests:
@@ -59,7 +59,7 @@ Tests:
 ./tests/e2e/test-frontend.sh
 
 # Production (when frontend is deployed)
-BASE_URL=https://oauth.divine.video API_URL=https://oauth.divine.video \
+BASE_URL=https://login.divine.video API_URL=https://login.divine.video \
   ./tests/e2e/test-frontend.sh
 ```
 Tests:
@@ -78,7 +78,7 @@ cargo test --workspace
 
 ### API (Port 3000)
 - Rust/Axum
-- SQLite database
+- PostgreSQL database
 - NIP-46 bunker implementation
 
 ### Web (Port 5173)

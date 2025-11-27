@@ -95,11 +95,11 @@ DROP INDEX IF EXISTS oauth_authorizations_bunker_public_key_key;
 CREATE UNIQUE INDEX idx_oauth_authorizations_bunker_public_key_tenant ON oauth_authorizations(tenant_id, bunker_public_key);
 
 -- ================ INSERT DEFAULT TENANT ================
--- Create tenant for existing oauth.divine.video deployment
+-- Create tenant for existing login.divine.video deployment
 INSERT INTO tenants (id, domain, name, settings, created_at, updated_at)
 VALUES (
     1,
-    'oauth.divine.video',
+    'login.divine.video',
     'Divine Video',
     '{"relay":"wss://relay.damus.io","email_from":"noreply@divine.video"}',
     NOW(),

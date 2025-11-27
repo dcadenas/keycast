@@ -4,10 +4,10 @@
 
 ### Current Active Services
 
-- **`keycast-unified`** (PRODUCTION - oauth.divine.video)
+- **`keycast-unified`** (PRODUCTION - login.divine.video)
   - Runs both API + Signer daemon in one container
   - Command: `--args=unified`
-  - Domain: https://oauth.divine.video
+  - Domain: https://login.divine.video
   - Memory: 2Gi, CPU: 2
   - Port: 3000
 
@@ -57,7 +57,7 @@ gcloud run deploy keycast-signer \
 
 ### CRITICAL: Database Persistence Issue
 
-**Current Problem**: Production uses an ephemeral SQLite database stored at `/app/database/keycast.db` which is RECREATED on every deployment, **losing all data**.
+**Current Problem**: Production uses an ephemeral PostgreSQL database stored at `/app/database/keycast.db` which is RECREATED on every deployment, **losing all data**.
 
 **Litestream Backup Not Working**: There's a path mismatch between:
 - Application database: `/app/database/keycast.db`
@@ -72,7 +72,7 @@ Litestream is NOT actually backing up the application database!
 ## Service Architecture
 
 ```
-oauth.divine.video (DNS)
+login.divine.video (DNS)
     ↓
 Cloud Load Balancer / Domain Mapping
     ↓
@@ -91,15 +91,14 @@ keycast-unified (Cloud Run)
 See `cloudbuild.yaml` for the full list of required environment variables:
 - `NODE_ENV=production`
 - `USE_GCP_KMS=true`
-- `CORS_ALLOWED_ORIGIN=https://oauth.divine.video`
-- `APP_URL=https://oauth.divine.video`
+- `CORS_ALLOWED_ORIGIN=https://login.divine.video`
+- `APP_URL=https://login.divine.video`
 - etc.
 
 ## Secrets (Google Secret Manager)
 
 - `MASTER_KEY_PATH` - Encryption master key
 - `SENDGRID_API_KEY` - Email service
-- `JWT_SECRET` - JWT token signing key
 
 ## Smoke Tests
 

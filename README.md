@@ -32,7 +32,7 @@ Contributions are welcome! Please fork or clone the repository and submit a PR w
 
 ### The stack
 
-The `api` subdirectory is a Rust application that uses SQLx for database interactions on a local SQLite database. We use `cargo watch` to run the API in watch mode, make sure to install that if you don't already have it.
+The `api` subdirectory is a Rust application that uses SQLx for database interactions on a PostgreSQL database. We use `cargo watch` to run the API in watch mode, make sure to install that if you don't already have it.
 - [Rust](https://www.rust-lang.org/)
 - [SQLx](https://github.com/launchbadge/sqlx)
 - [cargo-watch](https://github.com/watchexec/cargo-watch)
@@ -55,7 +55,7 @@ The `web` subdirectory contains a SvelteKit app that uses Bun for bundling and T
 
 ### Managing the database
 
-The database is a local SQLite database. There is a helper command to reset the database (drop, create, and run migrations). More can be added as needed.
+The database is a PostgreSQL database. There is a helper command to reset the database (drop, create, and run migrations). More can be added as needed.
 
 - `bun run db:reset` - Reset the database (drop, create, and run migrations)
 

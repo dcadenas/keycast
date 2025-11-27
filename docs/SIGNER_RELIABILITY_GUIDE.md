@@ -434,7 +434,7 @@ docker-compose logs keycast-signer | tail -100
 
 **2. Common crash causes:**
 - **Relay connection failures**: Check internet connectivity, firewall rules for wss://
-- **Database corruption**: Run `sqlite3 database/keycast.db "PRAGMA integrity_check;"`
+- **Database corruption**: Run `psql database/keycast.db "PRAGMA integrity_check;"`
 - **Memory exhaustion**: Check `docker stats` or `systemctl status keycast-signer` for OOM
 - **KMS permission errors**: Check service account has `cloudkms.cryptoKeyVersions.useToDecrypt`
 
@@ -623,7 +623,7 @@ Add to `/etc/logrotate.d/keycast`:
 #!/bin/bash
 BACKUP_DIR=/opt/keycast/backups
 mkdir -p $BACKUP_DIR
-sqlite3 /opt/keycast/database/keycast.db ".backup $BACKUP_DIR/keycast-$(date +%Y%m%d).db"
+psql /opt/keycast/database/keycast.db ".backup $BACKUP_DIR/keycast-$(date +%Y%m%d).db"
 
 # Keep last 7 days
 find $BACKUP_DIR -name "keycast-*.db" -mtime +7 -delete
@@ -720,7 +720,7 @@ sudo systemctl restart keycast-signer
    rm /opt/keycast/database/.signer.pid
 
    # Check database integrity
-   sqlite3 /opt/keycast/database/keycast.db "PRAGMA integrity_check;"
+   psql /opt/keycast/database/keycast.db "PRAGMA integrity_check;"
 
    # Start service
    sudo systemctl start keycast-signer

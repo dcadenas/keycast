@@ -227,7 +227,7 @@ VALUES (
     'keycast-login',
     'not-used-for-personal-auth',  -- Personal auth uses JWT, not OAuth client secret
     'Personal Keycast Bunker',
-    'http://localhost:3000/api/connect,https://oauth.divine.video/api/connect',
+    'http://localhost:3000/api/connect,https://login.divine.video/api/connect',
     (SELECT id FROM policies WHERE name = 'Standard Social (Default)' AND tenant_id = 1 LIMIT 1),
     1,  -- Default tenant
     NOW(),

@@ -38,7 +38,7 @@ The fix for profile publishing has been deployed to production. Here's how to te
 
 ## Production Deployment Status
 
-✅ Code deployed to https://oauth.divine.video
+✅ Code deployed to https://login.divine.video
 ✅ Build ID: 4b3a3bd3-082d-4f28-8501-dae545c49189
 ✅ Deployment: SUCCESS
 ✅ Public directory fix included (register, login, profile, dashboard pages)
