@@ -10,6 +10,7 @@ WORKDIR /app
 COPY ./api ./api
 COPY ./signer ./signer
 COPY ./core ./core
+COPY ./keycast ./keycast
 COPY ./Cargo.toml ./Cargo.toml
 COPY ./Cargo.lock ./Cargo.lock
 
@@ -25,6 +26,9 @@ RUN apt-get update && apt-get install -y \
     make \
     g++ \
     && rm -rf /var/lib/apt/lists/*
+
+# Install node-gyp globally for native module builds
+RUN bun add -g node-gyp
 
 ARG VITE_DOMAIN
 ENV VITE_DOMAIN=$VITE_DOMAIN
@@ -58,7 +62,13 @@ RUN bun run build
 
 # Final stage
 FROM debian:bookworm-slim AS runtime
+
+# Kamal service label
+LABEL service="keycast"
 WORKDIR /app
+
+# Kamal service label
+LABEL service="keycast"
 
 # Install only the essential runtime dependencies
 RUN apt-get update && apt-get install -y \
@@ -79,9 +89,7 @@ RUN curl -fsSL https://bun.sh/install | bash
 # Create necessary directories
 RUN mkdir -p /app/database /data
 
-# Copy built artifacts
-COPY --from=rust-builder /app/target/release/keycast_api ./
-COPY --from=rust-builder /app/target/release/keycast_signer ./
+# Copy built artifacts - only keycast binary (unified)
 COPY --from=rust-builder /app/target/release/keycast ./
 COPY --from=web-builder /app/build ./web
 COPY --from=web-builder /app/package.json ./
@@ -93,16 +101,14 @@ COPY ./database/migrations ./database/migrations
 # Copy example HTML files for testing
 COPY ./examples ./examples
 
-# Copy public HTML files (landing, login, register, dashboard, profile)
-COPY ./public ./public
-
 # Copy keycast-login library that test files import from
 COPY ./keycast-login ./keycast-login
 
 # Set environment variables
 ENV NODE_ENV=production \
     BUN_ENV=production \
-    PATH=/root/.bun/bin:$PATH
+    PATH=/root/.bun/bin:$PATH \
+    WEB_BUILD_DIR=/app/web
 
 # Expose ports
 EXPOSE 3000 5173

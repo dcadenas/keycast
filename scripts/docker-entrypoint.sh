@@ -20,15 +20,9 @@ wait_for_port() {
     echo "Successfully connected to $host:$port"
 }
 
-if [ "$1" = "api" ]; then
-    echo "Starting API server..."
-    exec ./keycast_api
-elif [ "$1" = "unified" ]; then
+if [ "$1" = "unified" ] || [ "$1" = "keycast" ]; then
     echo "Starting unified service (API + Signer in single process)..."
     exec ./keycast
-elif [ "$1" = "signer" ]; then
-    echo "Starting signer daemon..."
-    exec ./keycast_signer
 elif [ "$1" = "web" ]; then
     # Check for API using api service name instead of localhost
     if [ ! -z "$WAIT_FOR_API" ]; then
@@ -43,11 +37,9 @@ elif [ "$1" = "web" ]; then
     fi
     echo "Starting web server..."
     exec bun web/index.js
-elif [ "$1" = "signer" ]; then
-    echo "Starting signer daemon..."
-    exec ./keycast_signer
 else
     echo "Unknown command: $1"
-    echo "Available commands: api, unified, signer, web"
+    echo "Available commands: unified, keycast, web"
+    echo "Note: Use 'unified' or 'keycast' for the main service"
     exit 1
 fi
