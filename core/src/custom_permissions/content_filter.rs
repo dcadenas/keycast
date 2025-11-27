@@ -20,7 +20,7 @@ impl CustomPermission for ContentFilter {
     fn from_permission(
         permission: &Permission,
     ) -> Result<Box<dyn CustomPermission>, PermissionError> {
-        let parsed_config: ContentFilterConfig = serde_json::from_value(permission.config.clone())
+        let parsed_config: ContentFilterConfig = serde_json::from_value(permission.config.0.clone())
             .map_err(|e| PermissionError::InvalidConfig(e.to_string()))?;
 
         Ok(Box::new(Self {

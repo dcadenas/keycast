@@ -35,30 +35,50 @@ let policies: PolicyWithPermissions[] = $state([]);
 
 $effect(() => {
     if (user?.pubkey && !unsignedAuthEvent) {
-        api.buildUnsignedAuthEvent(`/teams/${id}`, "GET", user.pubkey).then(
-            async (event) => {
-                unsignedAuthEvent = event;
-                if (unsignedAuthEvent) {
-                    if (!ndk.signer) {
-                        ndk.signer = new NDKNip07Signer();
-                    }
-                    await unsignedAuthEvent.sign();
-                    encodedAuthEvent = `Nostr ${btoa(JSON.stringify(unsignedAuthEvent))}`;
-                    api.get(`/teams/${id}`, {
-                        headers: { Authorization: encodedAuthEvent },
-                    })
-                        .then((teamResponse) => {
-                            team = teamResponse as TeamWithRelations;
-                            users = team.team_users;
-                            storedKeys = team.stored_keys;
-                            policies = team.policies;
+        const authMethod = getCurrentUser()?.authMethod;
+        let authHeaders: Record<string, string> = {};
+
+        if (authMethod === 'nip07') {
+            api.buildUnsignedAuthEvent(`/teams/${id}`, "GET", user.pubkey).then(
+                async (event) => {
+                    unsignedAuthEvent = event;
+                    if (unsignedAuthEvent) {
+                        if (!ndk.signer) {
+                            ndk.signer = new NDKNip07Signer();
+                        }
+                        await unsignedAuthEvent.sign();
+                        encodedAuthEvent = `Nostr ${btoa(JSON.stringify(unsignedAuthEvent))}`;
+                        authHeaders.Authorization = encodedAuthEvent;
+                        api.get(`/teams/${id}`, {
+                            headers: authHeaders,
                         })
-                        .finally(() => {
-                            isLoading = false;
-                        });
-                }
-            },
-        );
+                            .then((teamResponse) => {
+                                team = teamResponse as TeamWithRelations;
+                                users = team.team_users;
+                                storedKeys = team.stored_keys;
+                                policies = team.policies;
+                            })
+                            .finally(() => {
+                                isLoading = false;
+                            });
+                    }
+                },
+            );
+        } else {
+            // Cookie auth (sent automatically via credentials: 'include')
+            api.get(`/teams/${id}`, {
+                headers: authHeaders,
+            })
+                .then((teamResponse) => {
+                    team = teamResponse as TeamWithRelations;
+                    users = team.team_users;
+                    storedKeys = team.stored_keys;
+                    policies = team.policies;
+                })
+                .finally(() => {
+                    isLoading = false;
+                });
+        }
     }
 });
 
@@ -69,20 +89,25 @@ async function deleteTeam() {
             "Are you sure you want to delete this team? This action is irreversible.",
         )
     ) {
-        const authEvent = await api.buildUnsignedAuthEvent(
-            `/teams/${id}`,
-            "DELETE",
-            user?.pubkey,
-        );
-        if (!ndk.signer) {
-            ndk.signer = new NDKNip07Signer();
+        const authMethod = getCurrentUser()?.authMethod;
+        let authHeaders: Record<string, string> = {};
+
+        if (authMethod === 'nip07') {
+            const authEvent = await api.buildUnsignedAuthEvent(
+                `/teams/${id}`,
+                "DELETE",
+                user?.pubkey,
+            );
+            if (!ndk.signer) {
+                ndk.signer = new NDKNip07Signer();
+            }
+            await authEvent?.sign();
+            authHeaders.Authorization = `Nostr ${btoa(JSON.stringify(authEvent))}`;
         }
-        await authEvent?.sign();
+        // Otherwise cookie auth (sent automatically via credentials: 'include')
 
         api.delete(`/teams/${id}`, {
-            headers: {
-                Authorization: `Nostr ${btoa(JSON.stringify(authEvent))}`,
-            },
+            headers: authHeaders,
         }).then(() => {
             toast.success("Team deleted successfully");
             goto("/teams");
@@ -101,20 +126,25 @@ async function removeUser(userToRemove: User) {
     if (!user?.pubkey) return;
     if (!confirm("Are you sure you want to remove this user?")) return;
 
-    const authEvent = await api.buildUnsignedAuthEvent(
-        `/teams/${id}/users/${userToRemove.user_public_key}`,
-        "DELETE",
-        user?.pubkey,
-    );
-    if (!ndk.signer) {
-        ndk.signer = new NDKNip07Signer();
+    const authMethod = getCurrentUser()?.authMethod;
+    let authHeaders: Record<string, string> = {};
+
+    if (authMethod === 'nip07') {
+        const authEvent = await api.buildUnsignedAuthEvent(
+            `/teams/${id}/users/${userToRemove.user_public_key}`,
+            "DELETE",
+            user?.pubkey,
+        );
+        if (!ndk.signer) {
+            ndk.signer = new NDKNip07Signer();
+        }
+        await authEvent?.sign();
+        authHeaders.Authorization = `Nostr ${btoa(JSON.stringify(authEvent))}`;
     }
-    await authEvent?.sign();
+    // Otherwise cookie auth (sent automatically via credentials: 'include')
 
     api.delete(`/teams/${id}/users/${userToRemove.user_public_key}`, {
-        headers: {
-            Authorization: `Nostr ${btoa(JSON.stringify(authEvent))}`,
-        },
+        headers: authHeaders,
     })
         .then(() => {
             toast.success("User removed successfully");

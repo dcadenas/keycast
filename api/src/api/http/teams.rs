@@ -10,7 +10,7 @@ use nostr_sdk::prelude::*;
 use sqlx::PgPool;
 
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::extractors::AuthEvent;
+use crate::api::extractors::DualAuthEvent;
 use crate::state::get_key_manager;
 use keycast_core::custom_permissions::{allowed_kinds::AllowedKindsConfig, AVAILABLE_PERMISSIONS};
 use keycast_core::types::authorization::{
@@ -25,11 +25,14 @@ use keycast_core::types::user::{TeamUser, User};
 pub async fn list_teams(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    AuthEvent(event): AuthEvent,
+    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
 ) -> ApiResult<Json<Vec<TeamWithRelations>>> {
     let tenant_id = tenant.0.id;
 
-    let user = match User::find_by_pubkey(&pool, tenant_id, &event.pubkey).await {
+    let user_pubkey = PublicKey::from_hex(&user_pubkey_hex)
+        .map_err(|_| ApiError::bad_request("Invalid pubkey"))?;
+
+    let user = match User::find_by_pubkey(&pool, tenant_id, &user_pubkey).await {
         Ok(user) => user,
         Err(_) => {
             return Err(ApiError::not_found("User not found"));
@@ -44,10 +47,27 @@ pub async fn list_teams(
 pub async fn create_team(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    AuthEvent(event): AuthEvent,
+    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
     Json(request): Json<CreateTeamRequest>,
 ) -> ApiResult<Json<TeamWithRelations>> {
     let tenant_id = tenant.0.id;
+
+    // Check whitelist for team creation (if configured)
+    if let Ok(allowed_pubkeys) = std::env::var("ALLOWED_PUBKEYS") {
+        if !allowed_pubkeys.is_empty() {
+            let allowed: Vec<&str> = allowed_pubkeys.split(',').map(|s| s.trim()).collect();
+
+            if !allowed.contains(&user_pubkey_hex.as_str()) {
+                tracing::warn!("Team creation denied for non-whitelisted pubkey: {}", user_pubkey_hex);
+                return Err(ApiError::forbidden(
+                    "Team creation is restricted to authorized users. Contact admin for access."
+                ));
+            }
+
+            tracing::info!("Team creation authorized for whitelisted pubkey: {}", user_pubkey_hex);
+        }
+    }
+
     let mut tx = pool.begin().await?;
 
     // First, try to insert the user if they don't exist
@@ -59,7 +79,7 @@ pub async fn create_team(
             "#,
     )
     .bind(tenant_id)
-    .bind(event.pubkey.to_hex())
+    .bind(&user_pubkey_hex)
     .execute(&mut *tx)
     .await?;
 
@@ -86,7 +106,7 @@ pub async fn create_team(
     )
     .bind(tenant_id)
     .bind(team.id)
-    .bind(event.pubkey.to_hex())
+    .bind(&user_pubkey_hex)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -150,11 +170,11 @@ pub async fn create_team(
 pub async fn get_team(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    AuthEvent(event): AuthEvent,
+    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
     Path(team_id): Path<i32>,
 ) -> ApiResult<Json<TeamWithRelations>> {
     let tenant_id = tenant.0.id;
-    verify_admin(&pool, &event.pubkey, team_id, tenant_id).await?;
+    verify_admin(&pool, &user_pubkey_hex, team_id, tenant_id).await?;
 
     let team_with_relations = Team::find_with_relations(&pool, tenant_id, team_id).await?;
 
@@ -164,11 +184,11 @@ pub async fn get_team(
 pub async fn update_team(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    AuthEvent(event): AuthEvent,
+    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
     Json(request): Json<UpdateTeamRequest>,
 ) -> ApiResult<Json<Team>> {
     let tenant_id = tenant.0.id;
-    verify_admin(&pool, &event.pubkey, request.id, tenant_id).await?;
+    verify_admin(&pool, &user_pubkey_hex, request.id, tenant_id).await?;
 
     let mut tx = pool.begin().await?;
 
@@ -192,11 +212,11 @@ pub async fn update_team(
 pub async fn delete_team(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    AuthEvent(event): AuthEvent,
+    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
     Path(team_id): Path<i32>,
 ) -> ApiResult<StatusCode> {
     let tenant_id = tenant.0.id;
-    verify_admin(&pool, &event.pubkey, team_id, tenant_id).await?;
+    verify_admin(&pool, &user_pubkey_hex, team_id, tenant_id).await?;
 
     let mut tx = pool.begin().await?;
 
@@ -302,12 +322,12 @@ pub async fn delete_team(
 pub async fn add_user(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    AuthEvent(event): AuthEvent,
+    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
     Path(team_id): Path<i32>,
     Json(request): Json<AddTeammateRequest>,
 ) -> ApiResult<Json<TeamUser>> {
     let tenant_id = tenant.0.id;
-    verify_admin(&pool, &event.pubkey, team_id, tenant_id).await?;
+    verify_admin(&pool, &user_pubkey_hex, team_id, tenant_id).await?;
 
     let mut tx = pool.begin().await?;
 
@@ -368,11 +388,11 @@ pub async fn add_user(
 pub async fn remove_user(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    AuthEvent(event): AuthEvent,
+    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
     Path((team_id, user_public_key)): Path<(i32, String)>,
 ) -> ApiResult<StatusCode> {
     let tenant_id = tenant.0.id;
-    verify_admin(&pool, &event.pubkey, team_id, tenant_id).await?;
+    verify_admin(&pool, &user_pubkey_hex, team_id, tenant_id).await?;
 
     let mut tx = pool.begin().await?;
 
@@ -380,7 +400,7 @@ pub async fn remove_user(
         PublicKey::from_hex(&user_public_key).map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     // Check if the user is deleting themselves
-    if event.pubkey == removed_user_public_key {
+    if user_pubkey_hex == removed_user_public_key.to_hex() {
         // At least one admin has to remain in the team
         let remaining_admin_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_users WHERE tenant_id = $1 AND team_id = $2 AND user_public_key != $3 AND role = 'admin'")
             .bind(tenant_id)
@@ -412,12 +432,12 @@ pub async fn remove_user(
 pub async fn add_key(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    AuthEvent(event): AuthEvent,
+    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
     Path(team_id): Path<i32>,
     Json(request): Json<AddKeyRequest>,
 ) -> ApiResult<Json<PublicStoredKey>> {
     let tenant_id = tenant.0.id;
-    verify_admin(&pool, &event.pubkey, team_id, tenant_id).await?;
+    verify_admin(&pool, &user_pubkey_hex, team_id, tenant_id).await?;
 
     let mut tx = pool.begin().await?;
 
@@ -456,11 +476,11 @@ pub async fn add_key(
 pub async fn remove_key(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    AuthEvent(event): AuthEvent,
+    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
     Path((team_id, pubkey)): Path<(i32, String)>,
 ) -> ApiResult<StatusCode> {
     let tenant_id = tenant.0.id;
-    verify_admin(&pool, &event.pubkey, team_id, tenant_id).await?;
+    verify_admin(&pool, &user_pubkey_hex, team_id, tenant_id).await?;
 
     let mut tx = pool.begin().await?;
 
@@ -509,11 +529,11 @@ pub async fn remove_key(
 pub async fn get_key(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    AuthEvent(event): AuthEvent,
+    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
     Path((team_id, pubkey)): Path<(i32, String)>,
 ) -> ApiResult<Json<KeyWithRelations>> {
     let tenant_id = tenant.0.id;
-    verify_admin(&pool, &event.pubkey, team_id, tenant_id).await?;
+    verify_admin(&pool, &user_pubkey_hex, team_id, tenant_id).await?;
 
     let mut tx = pool.begin().await?;
 
@@ -603,12 +623,12 @@ pub async fn get_key(
 pub async fn add_authorization(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    AuthEvent(event): AuthEvent,
+    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
     Path((team_id, pubkey)): Path<(i32, String)>,
     Json(request): Json<AddAuthorizationRequest>,
 ) -> ApiResult<Json<Authorization>> {
     let tenant_id = tenant.0.id;
-    verify_admin(&pool, &event.pubkey, team_id, tenant_id).await?;
+    verify_admin(&pool, &user_pubkey_hex, team_id, tenant_id).await?;
 
     let stored_key_public_key =
         PublicKey::from_hex(&pubkey).map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -682,12 +702,12 @@ pub async fn add_authorization(
 pub async fn add_policy(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    AuthEvent(event): AuthEvent,
+    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
     Path(team_id): Path<i32>,
     Json(request): Json<CreatePolicyRequest>,
 ) -> ApiResult<Json<PolicyWithPermissions>> {
     let tenant_id = tenant.0.id;
-    verify_admin(&pool, &event.pubkey, team_id, tenant_id).await?;
+    verify_admin(&pool, &user_pubkey_hex, team_id, tenant_id).await?;
     let mut tx = pool.begin().await?;
 
     // Create the permissions
@@ -746,11 +766,14 @@ pub async fn add_policy(
 
 pub async fn verify_admin<'a>(
     pool: &'a PgPool,
-    pubkey: &'a PublicKey,
+    pubkey_hex: &'a str,
     team_id: i32,
     tenant_id: i64,
 ) -> ApiResult<()> {
-    match User::is_team_admin(pool, tenant_id, pubkey, team_id).await {
+    let pubkey = PublicKey::from_hex(pubkey_hex)
+        .map_err(|_| ApiError::bad_request("Invalid pubkey"))?;
+
+    match User::is_team_admin(pool, tenant_id, &pubkey, team_id).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(ApiError::forbidden(
             "You are not authorized to access this team",

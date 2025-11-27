@@ -10,8 +10,12 @@ class CurrentUser {
     /** Array of pubkeys that the current user follows */
     follows: string[] = $state([]);
 
-    constructor(pubkey: string) {
+    /** Authentication method used by this user */
+    authMethod: 'nip07' | 'cookie' | null = $state(null);
+
+    constructor(pubkey: string, authMethod: 'nip07' | 'cookie' | null = null) {
         this.user = ndk.getUser({ pubkey });
+        this.authMethod = authMethod;
         if (this.user) {
             this.fetchUserFollows();
         }
@@ -52,7 +56,22 @@ export function getCurrentUser(): CurrentUser | null {
     return currentUser;
 }
 
-export function setCurrentUser(npub: string | null): CurrentUser | null {
-    currentUser = npub ? new CurrentUser(npub) : null;
+export function setCurrentUser(
+    npub: string | null,
+    authMethod: 'nip07' | 'cookie' | null = null
+): CurrentUser | null {
+    if (npub) {
+        currentUser = new CurrentUser(npub, authMethod);
+        // Persist auth method to localStorage
+        if (typeof window !== 'undefined' && authMethod) {
+            localStorage.setItem('keycast_auth_method', authMethod);
+        }
+    } else {
+        currentUser = null;
+        // Clear auth method on logout
+        if (typeof window !== 'undefined') {
+            localStorage.removeItem('keycast_auth_method');
+        }
+    }
     return currentUser;
 }

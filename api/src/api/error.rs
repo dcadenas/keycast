@@ -59,25 +59,31 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match &self {
+        let (status, message) = match &self {
             ApiError::Database(e) => {
                 tracing::error!("Database error: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Please try again.".to_string())
             }
-            ApiError::Auth(_) => StatusCode::UNAUTHORIZED,
-            ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
-            ApiError::NotFound(_) => StatusCode::NOT_FOUND,
+            ApiError::Auth(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::Internal(msg) => {
                 tracing::error!("Internal error: {}", msg);
-                StatusCode::INTERNAL_SERVER_ERROR
+                (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Please try again.".to_string())
             }
-            ApiError::User(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            ApiError::Team(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::User(e) => {
+                tracing::error!("User error: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Please try again.".to_string())
+            }
+            ApiError::Team(e) => {
+                tracing::error!("Team error: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Please try again.".to_string())
+            }
         };
 
         let body = Json(json!({
-            "error": self.to_string()
+            "error": message
         }));
 
         (status, body).into_response()

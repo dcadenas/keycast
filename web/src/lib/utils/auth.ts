@@ -46,7 +46,7 @@ export async function signin(
         signedInUser.ndk = ndk;
         ndk.activeUser = signedInUser;
         const alreadySignedIn = !!getCurrentUser();
-        setCurrentUser(signedInUser.pubkey);
+        setCurrentUser(signedInUser.pubkey, 'nip07');
         document.cookie = `keycastUserPubkey=${signedInUser.pubkey}; max-age=1209600; SameSite=Lax; Secure; path=/`;
         if (!alreadySignedIn) {
             toast.success("Signed in successfully");
@@ -143,10 +143,25 @@ async function userFromNip07(ndk: NDK): Promise<NDKUser | null> {
 /**
  * Signs the user out.
  */
-export function signout(ndk: NDK) {
+export async function signout(ndk: NDK) {
+    // Call API logout endpoint to clear server-side session cookie
+    try {
+        const response = await fetch(`${import.meta.env.VITE_DOMAIN ? `https://${import.meta.env.VITE_DOMAIN}` : 'http://localhost:3000'}/api/auth/logout`, {
+            method: 'POST',
+            credentials: 'include',
+        });
+        if (!response.ok) {
+            console.error('Logout API call failed:', response.statusText);
+        }
+    } catch (error) {
+        console.error('Error calling logout API:', error);
+    }
+
+    // Clear client-side state
     setCurrentUser(null);
     ndk.activeUser = undefined;
-    document.cookie = "keycastUserPubkey=";
+    // Properly delete the client-side cookie by setting max-age=0 with the same path
+    document.cookie = "keycastUserPubkey=; max-age=0; path=/; SameSite=Lax; Secure";
     toast.success("Signed out");
     goto("/");
 }

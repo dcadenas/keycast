@@ -30,30 +30,50 @@ console.log(apiDomain);
 
 $effect(() => {
     if (user?.pubkey && !unsignedAuthEvent) {
-        api.buildUnsignedAuthEvent("/teams", "GET", user.pubkey).then(
-            async (event) => {
-                unsignedAuthEvent = event;
-                if (unsignedAuthEvent) {
-                    if (!ndk.signer) {
-                        ndk.signer = new NDKNip07Signer();
+        const authMethod = getCurrentUser()?.authMethod;
+        let authHeaders: Record<string, string> = {};
+
+        if (authMethod === 'nip07') {
+            api.buildUnsignedAuthEvent("/teams", "GET", user.pubkey).then(
+                async (event) => {
+                    unsignedAuthEvent = event;
+                    if (unsignedAuthEvent) {
+                        if (!ndk.signer) {
+                            ndk.signer = new NDKNip07Signer();
+                        }
+                        await unsignedAuthEvent.sign();
+                        encodedAuthEvent = `Nostr ${btoa(JSON.stringify(unsignedAuthEvent))}`;
+                        authHeaders.Authorization = encodedAuthEvent;
+                        api.get("/teams", {
+                            headers: authHeaders,
+                        })
+                            .then((teamsResponse) => {
+                                teams = teamsResponse as TeamWithRelations[];
+                            })
+                            .catch((error) => {
+                                console.error(error);
+                            })
+                            .finally(() => {
+                                isLoading = false;
+                            });
                     }
-                    await unsignedAuthEvent.sign();
-                    encodedAuthEvent = `Nostr ${btoa(JSON.stringify(unsignedAuthEvent))}`;
-                    api.get("/teams", {
-                        headers: { Authorization: encodedAuthEvent },
-                    })
-                        .then((teamsResponse) => {
-                            teams = teamsResponse as TeamWithRelations[];
-                        })
-                        .catch((error) => {
-                            console.error(error);
-                        })
-                        .finally(() => {
-                            isLoading = false;
-                        });
-                }
-            },
-        );
+                },
+            );
+        } else {
+            // Cookie auth (sent automatically via credentials: 'include')
+            api.get("/teams", {
+                headers: authHeaders,
+            })
+                .then((teamsResponse) => {
+                    teams = teamsResponse as TeamWithRelations[];
+                })
+                .catch((error) => {
+                    console.error(error);
+                })
+                .finally(() => {
+                    isLoading = false;
+                });
+        }
     }
 });
 
@@ -75,24 +95,29 @@ async function createTeam(inline = false) {
     if (!user?.pubkey) return;
 
     const name = inline ? inlineTeamName : newTeamName;
+    const authMethod = getCurrentUser()?.authMethod;
+    let authHeaders: Record<string, string> = {};
 
-    const authEvent = await api.buildUnsignedAuthEvent(
-        "/teams",
-        "POST",
-        user?.pubkey,
-        JSON.stringify({ name }),
-    );
-    if (!ndk.signer) {
-        ndk.signer = new NDKNip07Signer();
+    if (authMethod === 'nip07') {
+        const authEvent = await api.buildUnsignedAuthEvent(
+            "/teams",
+            "POST",
+            user?.pubkey,
+            JSON.stringify({ name }),
+        );
+        if (!ndk.signer) {
+            ndk.signer = new NDKNip07Signer();
+        }
+        await authEvent?.sign();
+        authHeaders.Authorization = `Nostr ${btoa(JSON.stringify(authEvent))}`;
     }
-    await authEvent?.sign();
+    // Otherwise cookie auth (sent automatically via credentials: 'include')
+
     api.post<TeamWithRelations>(
         "/teams",
         { name },
         {
-            headers: {
-                Authorization: `Nostr ${btoa(JSON.stringify(authEvent))}`,
-            },
+            headers: authHeaders,
         },
     )
         .then((newTeam) => {

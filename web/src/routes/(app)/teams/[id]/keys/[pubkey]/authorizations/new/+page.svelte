@@ -47,33 +47,56 @@ let readyToSubmit = $derived(
 
 $effect(() => {
     if (user?.pubkey && !unsignedAuthEvent) {
-        api.buildUnsignedAuthEvent(`/teams/${id}`, "GET", user.pubkey).then(
-            async (event) => {
-                unsignedAuthEvent = event;
-                if (unsignedAuthEvent) {
-                    if (!ndk.signer) {
-                        ndk.signer = new NDKNip07Signer();
-                    }
-                    await unsignedAuthEvent.sign();
-                    encodedAuthEvent = `Nostr ${btoa(JSON.stringify(unsignedAuthEvent))}`;
-                    api.get(`/teams/${id}`, {
-                        headers: { Authorization: encodedAuthEvent },
-                    })
-                        .then((teamResponse) => {
-                            teamWithRelations =
-                                teamResponse as TeamWithRelations;
-                            team = teamWithRelations.team;
-                            key = teamWithRelations.stored_keys.find(
-                                (key) => key.public_key === pubkey,
-                            );
-                            policies = teamWithRelations.policies;
+        const authMethod = getCurrentUser()?.authMethod;
+        let authHeaders: Record<string, string> = {};
+
+        if (authMethod === 'nip07') {
+            api.buildUnsignedAuthEvent(`/teams/${id}`, "GET", user.pubkey).then(
+                async (event) => {
+                    unsignedAuthEvent = event;
+                    if (unsignedAuthEvent) {
+                        if (!ndk.signer) {
+                            ndk.signer = new NDKNip07Signer();
+                        }
+                        await unsignedAuthEvent.sign();
+                        encodedAuthEvent = `Nostr ${btoa(JSON.stringify(unsignedAuthEvent))}`;
+                        authHeaders.Authorization = encodedAuthEvent;
+                        api.get(`/teams/${id}`, {
+                            headers: authHeaders,
                         })
-                        .finally(() => {
-                            isLoading = false;
-                        });
-                }
-            },
-        );
+                            .then((teamResponse) => {
+                                teamWithRelations =
+                                    teamResponse as TeamWithRelations;
+                                team = teamWithRelations.team;
+                                key = teamWithRelations.stored_keys.find(
+                                    (key) => key.public_key === pubkey,
+                                );
+                                policies = teamWithRelations.policies;
+                            })
+                            .finally(() => {
+                                isLoading = false;
+                            });
+                    }
+                },
+            );
+        } else {
+            // Cookie auth (sent automatically via credentials: 'include')
+            api.get(`/teams/${id}`, {
+                headers: authHeaders,
+            })
+                .then((teamResponse) => {
+                    teamWithRelations =
+                        teamResponse as TeamWithRelations;
+                    team = teamWithRelations.team;
+                    key = teamWithRelations.stored_keys.find(
+                        (key) => key.public_key === pubkey,
+                    );
+                    policies = teamWithRelations.policies;
+                })
+                .finally(() => {
+                    isLoading = false;
+                });
+        }
     }
 });
 
@@ -102,23 +125,28 @@ async function createAuthorization() {
         policy_id: selectedPolicyId,
     };
 
-    const authEvent = await api.buildUnsignedAuthEvent(
-        `/teams/${id}/keys/${pubkey}/authorizations`,
-        "POST",
-        user?.pubkey,
-        JSON.stringify(request),
-    );
+    const authMethod = getCurrentUser()?.authMethod;
+    let authHeaders: Record<string, string> = {};
 
-    if (!ndk.signer) {
-        ndk.signer = new NDKNip07Signer();
+    if (authMethod === 'nip07') {
+        const authEvent = await api.buildUnsignedAuthEvent(
+            `/teams/${id}/keys/${pubkey}/authorizations`,
+            "POST",
+            user?.pubkey,
+            JSON.stringify(request),
+        );
+
+        if (!ndk.signer) {
+            ndk.signer = new NDKNip07Signer();
+        }
+
+        await authEvent?.sign();
+        authHeaders.Authorization = `Nostr ${btoa(JSON.stringify(authEvent))}`;
     }
-
-    await authEvent?.sign();
+    // Otherwise cookie auth (sent automatically via credentials: 'include')
 
     api.post(`/teams/${id}/keys/${pubkey}/authorizations`, request, {
-        headers: {
-            Authorization: `Nostr ${btoa(JSON.stringify(authEvent))}`,
-        },
+        headers: authHeaders,
     })
         .then((_authorization) => {
             toast.success("Authorization created successfully");

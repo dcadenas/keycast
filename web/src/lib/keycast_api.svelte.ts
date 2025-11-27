@@ -28,10 +28,23 @@ export class KeycastApi {
         console.log("Making request to:", url);
         const headers = { ...this.defaultHeaders, ...options.headers };
 
-        const response = await fetch(url, { ...options, headers });
+        const response = await fetch(url, {
+            ...options,
+            headers,
+            credentials: options.credentials || 'include'  // Include cookies by default
+        });
 
         if (!response.ok) {
-            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            // Try to get the error message from the response body
+            let errorMessage: string;
+            try {
+                const errorBody = await response.json();
+                errorMessage = errorBody.error || errorBody.message || `Something went wrong. Please try again.`;
+            } catch {
+                // If we can't parse JSON, use a generic message
+                errorMessage = 'Something went wrong. Please try again.';
+            }
+            throw new Error(errorMessage);
         }
 
         if (response.status === 204) {

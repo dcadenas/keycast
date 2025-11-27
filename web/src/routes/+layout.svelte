@@ -1,51 +1,51 @@
 <script lang="ts">
 import "../app.css";
 import Header from "$lib/components/Header.svelte";
+import VerificationBanner from "$lib/components/VerificationBanner.svelte";
 import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
+import { fetchAccountStatus, clearAccountStatus } from "$lib/account_status.svelte";
 import { initApi } from "$lib/keycast_api.svelte";
-import ndk from "$lib/ndk.svelte";
-import { SigninMethod, signin, signout } from "$lib/utils/auth";
-import { onMount } from "svelte";
 import { Toaster } from "svelte-hot-french-toast";
+import { page } from "$app/stores";
 
-let { data, children } = $props();
-let keycastCookie = $derived(data.keycastCookie);
+let { data, children }: { data?: { keycastCookie?: string }, children: any } = $props();
+let keycastCookie = $derived(data?.keycastCookie);
 initApi();
 
 $effect(() => {
     if (keycastCookie && getCurrentUser()?.user?.pubkey !== keycastCookie) {
-        setCurrentUser(keycastCookie);
+        const savedMethod = (localStorage.getItem('keycast_auth_method') as 'nip07' | 'cookie') || 'cookie';
+        setCurrentUser(keycastCookie, savedMethod);
     }
 });
 
-onMount(() => {
-    if (!window.nostr) {
-        import("nostr-login")
-            .then(async ({ init }) => {
-                init({
-                    onAuth(npub, options) {
-                        if (options.type === "logout") {
-                            signout(ndk);
-                        } else {
-                            let user = ndk.getUser({ npub });
-                            signin(
-                                ndk,
-                                undefined,
-                                SigninMethod.NostrLogin,
-                                undefined,
-                                user,
-                            );
-                        }
-                    },
-                });
-            })
-            .catch((error) => console.log("Failed to load nostr-login", error));
+// Fetch account status when user is authenticated
+$effect(() => {
+    const currentUser = getCurrentUser();
+    if (currentUser?.authMethod === 'cookie') {
+        fetchAccountStatus();
+    } else {
+        clearAccountStatus();
     }
 });
+
+// Hide header on auth pages (full-page experience)
+// Show header on homepage if authenticated (dashboard mode)
+const authOnlyPaths = ['/login', '/register', '/verify-email'];
+const isAuthPage = $derived(authOnlyPaths.includes($page.url.pathname));
+const isHomepage = $derived($page.url.pathname === '/');
+const user = $derived(getCurrentUser());
+
+const showHeader = $derived(
+	!isAuthPage && (user || !isHomepage)
+);
 </script>
 
 <Toaster />
+{#if showHeader}
 <Header />
+<VerificationBanner />
+{/if}
 
 <div class="container">
 	<!-- Background orbs -->

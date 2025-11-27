@@ -46,23 +46,28 @@ async function createPolicy() {
         permissions,
     };
 
-    const authEvent = await api.buildUnsignedAuthEvent(
-        `/teams/${id}/policies`,
-        "POST",
-        user?.pubkey,
-        JSON.stringify(request),
-    );
+    const authMethod = getCurrentUser()?.authMethod;
+    let authHeaders: Record<string, string> = {};
 
-    if (!ndk.signer) {
-        ndk.signer = new NDKNip07Signer();
+    if (authMethod === 'nip07') {
+        const authEvent = await api.buildUnsignedAuthEvent(
+            `/teams/${id}/policies`,
+            "POST",
+            user?.pubkey,
+            JSON.stringify(request),
+        );
+
+        if (!ndk.signer) {
+            ndk.signer = new NDKNip07Signer();
+        }
+
+        await authEvent?.sign();
+        authHeaders.Authorization = `Nostr ${btoa(JSON.stringify(authEvent))}`;
     }
-
-    await authEvent?.sign();
+    // Otherwise cookie auth (sent automatically via credentials: 'include')
 
     api.post(`/teams/${id}/policies`, request, {
-        headers: {
-            Authorization: `Nostr ${btoa(JSON.stringify(authEvent))}`,
-        },
+        headers: authHeaders,
     })
         .then((policy) => {
             toast.success("Policy created successfully");

@@ -17,6 +17,17 @@ pub enum PermissionError {
     InvalidConfig(String),
 }
 
+/// Wrapper for JSON config stored as TEXT in database
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonConfig(pub serde_json::Value);
+
+impl TryFrom<String> for JsonConfig {
+    type Error = serde_json::Error;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Ok(JsonConfig(serde_json::from_str(&s)?))
+    }
+}
+
 /// A permission is database representation of a CustomPermission trait
 #[derive(Debug, FromRow, Serialize, Deserialize)]
 pub struct Permission {
@@ -25,7 +36,10 @@ pub struct Permission {
     /// The identifier of the permission
     pub identifier: String,
     /// The configuration of the permission
-    pub config: serde_json::Value,
+    #[sqlx(try_from = "String")]
+    pub config: JsonConfig,
+    /// Tenant ID for multi-tenancy
+    pub tenant_id: i64,
     /// The date and time the permission was created
     pub created_at: DateTime<chrono::Utc>,
     /// The date and time the permission was last updated
@@ -33,10 +47,15 @@ pub struct Permission {
 }
 
 impl Permission {
+    /// Get the config as serde_json::Value
+    pub fn config_value(&self) -> &serde_json::Value {
+        &self.config.0
+    }
+
     /// Convert this database permission into a CustomPermission implementation
     pub fn to_custom_permission(&self) -> Result<Box<dyn CustomPermission>, PermissionError> {
         match self.identifier.as_str() {
-            "allowed_kinds" => AllowedKinds::from_permission(self),
+            id if id.starts_with("allowed_kinds") => AllowedKinds::from_permission(self),
             "content_filter" => ContentFilter::from_permission(self),
             "encrypt_to_self" => EncryptToSelf::from_permission(self),
             _ => Err(PermissionError::UnknownPermission(self.identifier.clone())),

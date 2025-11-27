@@ -102,3 +102,18 @@ export type AllowedKindsConfig = {
 export type ContentFilterConfig = {
     blocked_words: string[] | null;
 };
+
+export type BunkerSession = {
+    application_name: string;
+    application_id: number | null;
+    bunker_pubkey: string;
+    secret: string;
+    client_pubkey: string | null;
+    created_at: string;
+    last_activity: string | null;
+    activity_count: number;
+};
+
+export type BunkerSessionsResponse = {
+    sessions: BunkerSession[];
+};

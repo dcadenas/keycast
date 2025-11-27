@@ -1,92 +1,42 @@
-use super::auth_middleware;
 use axum::{
-    middleware,
     routing::{delete, get, post, put},
     Router,
 };
+use keycast_core::authorization_channel::AuthorizationSender;
 use sqlx::PgPool;
 use std::sync::Arc;
 
 use crate::api::http::{auth, oauth, teams};
 use crate::state::KeycastState;
-use axum::response::{Html, Json as AxumJson};
+use axum::response::Json as AxumJson;
 use serde_json::Value as JsonValue;
 
 // State wrapper to pass state to auth handlers
 #[derive(Clone)]
 pub struct AuthState {
     pub state: Arc<KeycastState>,
+    pub auth_tx: Option<AuthorizationSender>,
 }
 
-async fn landing_page() -> Html<&'static str> {
-    Html(r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Keycast OAuth Server</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-               max-width: 800px; margin: 50px auto; padding: 20px; background: #1a1a1a; color: #e0e0e0; }
-        h1 { color: #bb86fc; }
-        h2 { color: #03dac6; margin-top: 30px; }
-        a { color: #03dac6; }
-        code { background: #2a2a2a; padding: 2px 6px; border-radius: 3px; }
-        .endpoint { background: #2a2a2a; padding: 10px; margin: 10px 0; border-radius: 5px; }
-        .method { color: #bb86fc; font-weight: bold; }
-    </style>
-</head>
-<body>
-    <h1>🔑 Keycast OAuth Server</h1>
-    <p>NIP-46 remote signing with OAuth 2.0 authorization</p>
-
-    <h2>Authentication Endpoints</h2>
-    <div class="endpoint">
-        <span class="method">POST</span> <code>/api/auth/register</code><br>
-        Register a new user with email/password
-    </div>
-    <div class="endpoint">
-        <span class="method">POST</span> <code>/api/auth/login</code><br>
-        Login and receive JWT token
-    </div>
-    <div class="endpoint">
-        <span class="method">GET</span> <code>/api/user/bunker</code><br>
-        Get personal NIP-46 bunker URL (requires auth)
-    </div>
-
-    <h2>OAuth 2.0 Endpoints</h2>
-    <div class="endpoint">
-        <span class="method">GET</span> <code>/api/oauth/authorize</code><br>
-        Authorization request (shows approval page)
-    </div>
-    <div class="endpoint">
-        <span class="method">POST</span> <code>/api/oauth/authorize</code><br>
-        User approves/denies authorization
-    </div>
-    <div class="endpoint">
-        <span class="method">POST</span> <code>/api/oauth/token</code><br>
-        Exchange authorization code for bunker URL
-    </div>
-
-    <h2>Test Clients</h2>
-    <p>Example OAuth clients available at <a href="http://localhost:8080">localhost:8080</a></p>
-</body>
-</html>
-    "#)
-}
-
-/// Build routes with explicit state - the proper way to structure an Axum app
-pub fn routes(pool: PgPool, state: Arc<KeycastState>) -> Router {
+/// Build API routes - pure JSON endpoints, no HTML
+/// Returns unrooted Router that can be nested at any path (e.g., /api, /v1, etc.)
+pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http::cors::CorsLayer, public_cors: tower_http::cors::CorsLayer, auth_tx: Option<AuthorizationSender>) -> Router {
     tracing::debug!("Building routes");
 
     let auth_state = AuthState {
         state,
+        auth_tx,
     };
 
-    // Public auth routes (no authentication required)
-    // Register and login need AuthState, email verification needs PgPool
-    let register_login_routes = Router::new()
+    // Routes that need restricted CORS (first-party only + credentials)
+    // These endpoints accept user credentials and must prevent phishing
+    let first_party_routes = Router::new()
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
+        .route("/auth/logout", post(auth::logout))
+        .route("/oauth/login", post(oauth::oauth_login))
+        .route("/oauth/register", post(oauth::oauth_register))
+        .layer(auth_cors.clone())
         .with_state(auth_state.clone());
 
     let email_routes = Router::new()
@@ -96,11 +46,15 @@ pub fn routes(pool: PgPool, state: Arc<KeycastState>) -> Router {
         .with_state(pool.clone());
 
     // OAuth routes (no authentication required for initial authorize request)
+    // Public CORS - third parties use authorization_code grant (never see passwords)
     let oauth_routes = Router::new()
+        .route("/oauth/auth-status", get(oauth::auth_status))
         .route("/oauth/authorize", get(oauth::authorize_get))
         .route("/oauth/authorize", post(oauth::authorize_post))
         .route("/oauth/token", post(oauth::token))
+        .route("/oauth/poll", get(oauth::poll))  // iOS PWA polling endpoint
         .route("/oauth/connect", post(oauth::connect_post))
+        .layer(public_cors.clone())
         .with_state(auth_state.clone());
 
     // nostr-login connect routes (wildcard path to capture nostrconnect:// URI)
@@ -113,33 +67,42 @@ pub fn routes(pool: PgPool, state: Arc<KeycastState>) -> Router {
         .route("/user/sign", post(auth::sign_event))
         .with_state(auth_state.clone());
 
-    // Protected user routes (authentication required)
+    // Protected user routes (authentication required via UCAN cookie)
+    // Need auth_cors (restricted origins + credentials) since they use cookies
     let user_routes = Router::new()
         .route("/user/bunker", get(auth::get_bunker_url))
         .route("/user/pubkey", get(auth::get_pubkey))
+        .route("/user/account", get(auth::get_account_status))
+        .route("/auth/resend-verification", post(auth::resend_verification))
         .route("/user/profile", get(auth::get_profile))
         .route("/user/sessions", get(auth::list_sessions))
         .route("/user/permissions", get(auth::list_permissions))
         .route("/user/sessions/:secret/activity", get(auth::get_session_activity))
-        .with_state(pool.clone());
-
-    let profile_update_routes = Router::new()
         .route("/user/profile", post(auth::update_profile))
         .route("/user/sessions/revoke", post(auth::revoke_session))
-        .layer(middleware::from_fn(auth_middleware))
-        .with_state(pool.clone());
-
-    // Key export routes (needs both pool and key_manager)
-    let key_export_routes = Router::new()
         .route("/user/verify-password", post(auth::verify_password_for_export))
         .route("/user/request-key-export", post(auth::request_key_export))
         .route("/user/verify-export-code", post(auth::verify_export_code))
-        .with_state(pool.clone())
-        .layer(middleware::from_fn(auth_middleware));
+        .layer(auth_cors.clone())
+        .with_state(pool.clone());
 
-    let key_export_final = Router::new()
+    // Bunker creation route (needs AuthState for key_manager)
+    let bunker_routes = Router::new()
+        .route("/user/bunker/create", post(auth::create_bunker))
+        .layer(auth_cors.clone())
+        .with_state(auth_state.clone());
+
+    // Key export routes (need AuthState for key_manager)
+    let key_export_routes = Router::new()
         .route("/user/export-key", post(auth::export_key))
-        .layer(middleware::from_fn(auth_middleware))
+        .route("/user/export-key-simple", post(auth::export_key_simple))
+        .layer(auth_cors.clone())
+        .with_state(auth_state.clone());
+
+    // Change key route (needs AuthState for key_manager and auth_tx)
+    let change_key_route = Router::new()
+        .route("/user/change-key", post(auth::change_key))
+        .layer(auth_cors.clone())
         .with_state(auth_state.clone());
 
     // NIP-05 discovery route (public, no auth required)
@@ -171,23 +134,25 @@ pub fn routes(pool: PgPool, state: Arc<KeycastState>) -> Router {
             post(teams::add_authorization),
         )
         .route("/teams/:id/policies", post(teams::add_policy))
-        .layer(middleware::from_fn(auth_middleware))
         .with_state(pool);
 
     // Combine routes
+    // First-party routes have restricted CORS (prevent phishing)
+    // Authenticated routes have restricted CORS (need cookies)
+    // Public routes have wildcard CORS (third-party safe, no credentials)
     Router::new()
-        .merge(register_login_routes)
-        .merge(email_routes)
-        .merge(oauth_routes)
-        .merge(connect_routes)
-        .merge(signing_routes)
-        .merge(user_routes)
-        .merge(profile_update_routes)
-        .merge(key_export_routes)
-        .merge(key_export_final)
-        .merge(team_routes)
-        .merge(discovery_route)
-        .merge(docs_route)
+        .merge(first_party_routes)      // Has auth_cors (credentials, needs cookies)
+        .merge(user_routes)              // Has auth_cors (authenticated, needs cookies)
+        .merge(bunker_routes)            // Has auth_cors (bunker creation)
+        .merge(key_export_routes)        // Has auth_cors (authenticated, needs cookies)
+        .merge(change_key_route)         // Has auth_cors (authenticated, needs cookies)
+        .merge(email_routes.layer(public_cors.clone()))
+        .merge(oauth_routes)             // Has public_cors (third-party safe)
+        .merge(connect_routes.layer(public_cors.clone()))
+        .merge(signing_routes.layer(public_cors.clone()))
+        .merge(team_routes.layer(public_cors.clone()))
+        .merge(discovery_route.layer(public_cors.clone()))
+        .merge(docs_route.layer(public_cors))
 }
 
 /// Serve OpenAPI specification as JSON
@@ -215,7 +180,7 @@ pub async fn nostr_discovery_public(
     if let Some(name) = params.get("name") {
         // Look up user by username in this tenant
         let result: Option<(String,)> = sqlx::query_as(
-            "SELECT public_key FROM users WHERE username = ?1 AND tenant_id = ?2"
+            "SELECT public_key FROM users WHERE username = $1 AND tenant_id = $2"
         )
         .bind(name)
         .bind(tenant_id)

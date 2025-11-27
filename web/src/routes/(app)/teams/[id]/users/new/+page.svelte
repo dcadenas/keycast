@@ -33,43 +33,69 @@ async function addTeammate() {
         return;
     }
 
-    api.buildUnsignedAuthEvent(
-        `/teams/${id}/users`,
-        "POST",
-        user.pubkey,
-        JSON.stringify({
-            user_public_key: ndkUser.pubkey,
-            role,
-        }),
-    ).then(async (event) => {
-        unsignedAuthEvent = event;
-        if (unsignedAuthEvent) {
-            if (!ndk.signer) {
-                ndk.signer = new NDKNip07Signer();
+    const authMethod = getCurrentUser()?.authMethod;
+    let authHeaders: Record<string, string> = {};
+
+    if (authMethod === 'nip07') {
+        api.buildUnsignedAuthEvent(
+            `/teams/${id}/users`,
+            "POST",
+            user.pubkey,
+            JSON.stringify({
+                user_public_key: ndkUser.pubkey,
+                role,
+            }),
+        ).then(async (event) => {
+            unsignedAuthEvent = event;
+            if (unsignedAuthEvent) {
+                if (!ndk.signer) {
+                    ndk.signer = new NDKNip07Signer();
+                }
+                await unsignedAuthEvent.sign();
+                console.log(unsignedAuthEvent);
+                const encodedAuthEvent = `Nostr ${btoa(JSON.stringify(unsignedAuthEvent))}`;
+                authHeaders.Authorization = encodedAuthEvent;
+                api.post<User>(
+                    `/teams/${id}/users`,
+                    {
+                        user_public_key: ndkUser.pubkey,
+                        role,
+                    },
+                    {
+                        headers: authHeaders,
+                    },
+                )
+                    .then((_newUser) => {
+                        toast.success("Teammate added successfully");
+                        goto(`/teams/${id}`);
+                    })
+                    .catch((error) => {
+                        toast.error("Failed to add teammate");
+                        errorMessage = error.message;
+                    });
             }
-            await unsignedAuthEvent.sign();
-            console.log(unsignedAuthEvent);
-            const encodedAuthEvent = `Nostr ${btoa(JSON.stringify(unsignedAuthEvent))}`;
-            api.post<User>(
-                `/teams/${id}/users`,
-                {
-                    user_public_key: ndkUser.pubkey,
-                    role,
-                },
-                {
-                    headers: { Authorization: encodedAuthEvent },
-                },
-            )
-                .then((_newUser) => {
-                    toast.success("Teammate added successfully");
-                    goto(`/teams/${id}`);
-                })
-                .catch((error) => {
-                    toast.error("Failed to add teammate");
-                    errorMessage = error.message;
-                });
-        }
-    });
+        });
+    } else {
+        // Cookie auth (sent automatically via credentials: 'include')
+        api.post<User>(
+            `/teams/${id}/users`,
+            {
+                user_public_key: ndkUser.pubkey,
+                role,
+            },
+            {
+                headers: authHeaders,
+            },
+        )
+            .then((_newUser) => {
+                toast.success("Teammate added successfully");
+                goto(`/teams/${id}`);
+            })
+            .catch((error) => {
+                toast.error("Failed to add teammate");
+                errorMessage = error.message;
+            });
+    }
 }
 </script>
 

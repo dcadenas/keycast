@@ -29,39 +29,62 @@ async function createKey() {
         return;
     }
 
-    api.buildUnsignedAuthEvent(
-        `/teams/${id}/keys`,
-        "POST",
-        user.pubkey,
-        JSON.stringify({
-            key_name: keyName,
-            secret_key: secretKey,
-        }),
-    ).then(async (event) => {
-        unsignedAuthEvent = event;
-        if (unsignedAuthEvent) {
-            if (!ndk.signer) {
-                ndk.signer = new NDKNip07Signer();
+    const authMethod = getCurrentUser()?.authMethod;
+    let authHeaders: Record<string, string> = {};
+
+    if (authMethod === 'nip07') {
+        api.buildUnsignedAuthEvent(
+            `/teams/${id}/keys`,
+            "POST",
+            user.pubkey,
+            JSON.stringify({
+                key_name: keyName,
+                secret_key: secretKey,
+            }),
+        ).then(async (event) => {
+            unsignedAuthEvent = event;
+            if (unsignedAuthEvent) {
+                if (!ndk.signer) {
+                    ndk.signer = new NDKNip07Signer();
+                }
+                await unsignedAuthEvent.sign();
+                const encodedAuthEvent = `Nostr ${btoa(JSON.stringify(unsignedAuthEvent))}`;
+                authHeaders.Authorization = encodedAuthEvent;
+                api.post<StoredKey>(
+                    `/teams/${id}/keys`,
+                    { name: keyName, secret_key: secretKey },
+                    {
+                        headers: authHeaders,
+                    },
+                )
+                    .then((newKey) => {
+                        toast.success("Key created successfully");
+                        goto(`/teams/${id}`);
+                    })
+                    .catch((error) => {
+                        toast.error("Failed to create key");
+                        keyError = error.message;
+                    });
             }
-            await unsignedAuthEvent.sign();
-            const encodedAuthEvent = `Nostr ${btoa(JSON.stringify(unsignedAuthEvent))}`;
-            api.post<StoredKey>(
-                `/teams/${id}/keys`,
-                { name: keyName, secret_key: secretKey },
-                {
-                    headers: { Authorization: encodedAuthEvent },
-                },
-            )
-                .then((newKey) => {
-                    toast.success("Key created successfully");
-                    goto(`/teams/${id}`);
-                })
-                .catch((error) => {
-                    toast.error("Failed to create key");
-                    keyError = error.message;
-                });
-        }
-    });
+        });
+    } else {
+        // Cookie auth (sent automatically via credentials: 'include')
+        api.post<StoredKey>(
+            `/teams/${id}/keys`,
+            { name: keyName, secret_key: secretKey },
+            {
+                headers: authHeaders,
+            },
+        )
+            .then((newKey) => {
+                toast.success("Key created successfully");
+                goto(`/teams/${id}`);
+            })
+            .catch((error) => {
+                toast.error("Failed to create key");
+                keyError = error.message;
+            });
+    }
 }
 </script>
 

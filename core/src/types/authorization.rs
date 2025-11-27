@@ -255,8 +255,31 @@ impl Authorization {
         Ok(stored_key)
     }
 
-    /// Get the permissions for this authorization
-    /// This method is synchronous/blocking so that we can use it in the signing daemon
+    /// Get the permissions for this authorization (async version)
+    pub async fn permissions(
+        &self,
+        pool: &PgPool,
+        tenant_id: i64,
+    ) -> Result<Vec<Permission>, AuthorizationError> {
+        let permissions = sqlx::query_as::<_, Permission>(
+            r#"
+            SELECT p.*
+            FROM permissions p
+            JOIN policy_permissions pp ON pp.permission_id = p.id
+            JOIN policies pol ON pol.id = pp.policy_id
+            WHERE p.tenant_id = $1 AND pol.id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(self.policy_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(permissions)
+    }
+
+    /// Get the permissions for this authorization (synchronous for backward compatibility)
+    #[deprecated(note = "Use async permissions() method instead")]
     pub fn permissions_sync(
         &self,
         pool: &PgPool,
@@ -264,30 +287,22 @@ impl Authorization {
     ) -> Result<Vec<Permission>, AuthorizationError> {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                let permissions = sqlx::query_as::<_, Permission>(
-                    r#"
-                    SELECT p.*
-                    FROM permissions p
-                    JOIN policy_permissions pp ON pp.permission_id = p.id
-                    JOIN policies pol ON pol.id = pp.policy_id
-                    WHERE pp.tenant_id = $1 AND pol.id = $2
-                    "#,
-                )
-                .bind(tenant_id)
-                .bind(self.policy_id)
-                .fetch_all(pool)
-                .await?;
-                Ok(permissions)
+                self.permissions(pool, tenant_id).await
             })
         })
     }
 
     /// Generate a connection string for the authorization
-    /// bunker://<remote-signer-pubkey>?relay=<encoded-relay-1,encoded-relay-2>&secret=<encoded-secret>
+    ///
+    /// Format: `bunker://<remote-signer-pubkey>?relay=<encoded-relay-1,encoded-relay-2>&secret=<encoded-secret>`
+    ///
+    /// Uses the deployment-wide BUNKER_RELAYS configuration (not per-authorization relays).
+    /// All bunker URLs reference the same relay infrastructure for security and scalability.
     pub async fn bunker_connection_string(&self) -> Result<String, AuthorizationError> {
-        let relay_params = self
-            .relays
-            .0
+        // Get deployment-wide relay list from environment
+        let relays = Self::get_bunker_relays();
+
+        let relay_params = relays
             .iter()
             .map(|r| format!("relay={}", urlencoding::encode(r)))
             .collect::<Vec<_>>()
@@ -299,6 +314,18 @@ impl Authorization {
             relay_params,
             urlencoding::encode(&self.secret),
         ))
+    }
+
+    /// Get the configured bunker relay list from environment
+    pub fn get_bunker_relays() -> Vec<String> {
+        let relays_str = std::env::var("BUNKER_RELAYS")
+            .unwrap_or_else(|_| "wss://relay.damus.io,wss://relay.nsec.app,wss://nos.lol".to_string());
+
+        relays_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 
     fn expired(&self) -> Result<bool, AuthorizationError> {
