@@ -50,7 +50,7 @@ impl EmailService {
             .unwrap_or_else(|_| "Keycast".to_string());
 
         let base_url = env::var("BASE_URL")
-            .unwrap_or_else(|_| "https://oauth.divine.video".to_string());
+            .unwrap_or_else(|_| "https://login.divine.video".to_string());
 
         Ok(Self {
             api_key,
